@@ -1,6 +1,6 @@
 # ghost-text-prepper
 
-Daily prep of Ghost draft posts: short SEO/social copy + feature image via Hugging Face.
+Daily prep of Ghost draft posts: HF excerpt + Bonsai feature image.
 
 Follow [ponytail](https://github.com/DietrichGebert/ponytail):
 

@@ -1,4 +1,4 @@
-"""Prep Ghost draft posts: ≤146-char SEO copy + Bonsai feature image."""
+"""Prep Ghost draft posts: HF excerpt + Bonsai feature image."""
 
 from __future__ import annotations
 
@@ -23,6 +23,7 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 log = logging.getLogger("ghost-prep")
 
+
 def _env(name: str, default: str = "") -> str:
     return (os.getenv(name) or default).strip()
 
@@ -44,7 +45,6 @@ MAX_EXCERPT_LEN = int(_env("MAX_EXCERPT_LEN", "146"))
 SKIP_COMPLETE = _env("SKIP_COMPLETE", "1") not in ("0", "false", "False")
 STATE_FILE = Path(_env("STATE_FILE", "state/last-run.json"))
 
-# Article body sent to the LLM — keep prompt under typical context comfort
 _MAX_ARTICLE_CHARS = 6000
 
 http = httpx.Client(timeout=httpx.Timeout(30.0, read=180.0))
@@ -178,7 +178,6 @@ def list_drafts(since: datetime) -> list[dict[str, Any]]:
 
 
 def upload_image(png_bytes: bytes, filename: str) -> str:
-    # Do not set Content-Type — httpx sets multipart boundary
     response = http.post(
         f"{GHOST_URL}/ghost/api/admin/images/upload/",
         headers={
@@ -210,21 +209,6 @@ def _hf_client() -> InferenceClient:
     return InferenceClient(api_key=HF_TOKEN)
 
 
-def _chat(system: str, user: str, *, max_tokens: int) -> str:
-    client = _hf_client()
-    completion = client.chat.completions.create(
-        model=HF_TEXT_MODEL,
-        messages=[
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ],
-        max_tokens=max_tokens,
-        temperature=0.3,
-    )
-    choice = completion.choices[0].message.content or ""
-    return choice.strip()
-
-
 def generate_excerpt(title: str, body: str) -> str:
     system = (
         "You write short SEO / social meta descriptions for blog posts. "
@@ -233,24 +217,28 @@ def generate_excerpt(title: str, body: str) -> str:
         "No quotes, no hashtags, no emoji, no title prefix."
     )
     user = f"Title: {title}\n\nArticle:\n{body[:_MAX_ARTICLE_CHARS]}"
-    return truncate_excerpt(_chat(system, user, max_tokens=120))
-
-
-def generate_image_prompt(title: str, body: str) -> str:
-    system = (
-        "You write English prompts for a text-to-image model. "
-        "Describe a single editorial photograph or illustration that matches the article topic. "
-        "Rules: no text, letters, logos, watermarks, or UI on the image; "
-        "no people with readable name tags; photorealistic or clean illustration; "
-        "one coherent scene. Reply with the prompt only, under 400 characters."
+    client = _hf_client()
+    completion = client.chat.completions.create(
+        model=HF_TEXT_MODEL,
+        messages=[
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+        max_tokens=120,
+        temperature=0.3,
     )
-    user = f"Title: {title}\n\nArticle:\n{body[:_MAX_ARTICLE_CHARS]}"
-    prompt = _chat(system, user, max_tokens=200)
-    prompt = re.sub(r"\s+", " ", prompt.strip().strip("\"'"))
-    # Reinforce no-text constraint for the image model
-    if "no text" not in prompt.lower():
-        prompt = f"{prompt}, no text, no letters, no watermark"
-    return prompt[:500]
+    text = (completion.choices[0].message.content or "").strip()
+    return truncate_excerpt(text)
+
+
+def image_prompt_from_title(title: str) -> str:
+    # ponytail: no second LLM call — HF is only used for excerpt
+    clean = re.sub(r"\s+", " ", (title or "blog topic").strip())[:200]
+    return (
+        f"Editorial photograph about: {clean}. "
+        "Single coherent scene, photorealistic or clean illustration, "
+        "no text, no letters, no logos, no watermark, no UI"
+    )
 
 
 def generate_image(prompt: str) -> bytes:
@@ -297,7 +285,7 @@ def process_post(post: dict[str, Any]) -> dict[str, Any]:
 
     image_url = post.get("feature_image")
     if not image_url:
-        prompt = generate_image_prompt(title, body)
+        prompt = image_prompt_from_title(title)
         log.info("image prompt for %s: %s", post_id, prompt[:160])
         png = generate_image(prompt)
         slug = re.sub(r"[^a-z0-9]+", "-", (post.get("slug") or post_id).lower()).strip("-") or post_id
@@ -386,6 +374,7 @@ def _self_check() -> None:
     assert needs_prep({"custom_excerpt": "x", "feature_image": "https://x/y.png"}) is False
     when = datetime(2026, 7, 17, 6, 0, 0, tzinfo=timezone.utc)
     assert to_ghost_filter_date(when) == "2026-07-17T06:00:00.000Z"
+    assert "no text" in image_prompt_from_title("VPN обзор")
     log.info("self-check ok")
 
 

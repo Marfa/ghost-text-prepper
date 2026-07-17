@@ -174,6 +174,8 @@ def update_post(post_id: str, updated_at: str, fields: dict[str, Any]) -> dict[s
 def _hf_client() -> InferenceClient:
     if not HF_TOKEN:
         raise RuntimeError("Missing HF_TOKEN")
+    if not HF_TOKEN.startswith("hf_"):
+        raise RuntimeError("HF_TOKEN must start with hf_ (check for typos in .env / GitHub secret)")
     return InferenceClient(api_key=HF_TOKEN)
 
 

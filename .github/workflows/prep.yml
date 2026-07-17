@@ -1,0 +1,39 @@
+name: Daily draft prep
+
+on:
+  schedule:
+    # Once per day, 06:00 UTC
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+
+jobs:
+  prep:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      - run: python app.py --self-check
+
+      - name: Prep drafts
+        env:
+          GHOST_URL: ${{ secrets.GHOST_URL }}
+          GHOST_ADMIN_API_KEY: ${{ secrets.GHOST_ADMIN_API_KEY }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_TEXT_MODEL: ${{ vars.HF_TEXT_MODEL }}
+          BONSAI_URL: ${{ vars.BONSAI_URL }}
+          BONSAI_BACKEND: ${{ vars.BONSAI_BACKEND }}
+          BONSAI_SEED: ${{ vars.BONSAI_SEED }}
+          BONSAI_STEPS: ${{ vars.BONSAI_STEPS }}
+          BONSAI_WIDTH: ${{ vars.BONSAI_WIDTH }}
+          BONSAI_HEIGHT: ${{ vars.BONSAI_HEIGHT }}
+          BONSAI_TOKEN: ${{ secrets.BONSAI_TOKEN }}
+          MAX_EXCERPT_LEN: "146"
+          SKIP_COMPLETE: "1"
+        run: python app.py

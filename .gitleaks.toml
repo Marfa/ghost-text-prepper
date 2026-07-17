@@ -1,0 +1,11 @@
+# Allowlist placeholder examples only — never real tokens
+title = "ghost-text-prepper"
+
+[[allowlists]]
+description = "Example placeholders in .env.example"
+paths = ['''\.env\.example$''']
+regexes = [
+  '''hf_xxx''',
+  '''id:hex_secret_placeholder''',
+  '''your-site\.ghost\.io''',
+]

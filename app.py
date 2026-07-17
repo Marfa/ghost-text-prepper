@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import html
+import json
 import logging
 import os
 import re
 import time
+from datetime import datetime, timezone
 from html.parser import HTMLParser
 from io import BytesIO
+from pathlib import Path
 from typing import Any, Optional
 
 import httpx
@@ -39,11 +42,37 @@ BONSAI_TOKEN = _env("BONSAI_TOKEN")
 
 MAX_EXCERPT_LEN = int(_env("MAX_EXCERPT_LEN", "146"))
 SKIP_COMPLETE = _env("SKIP_COMPLETE", "1") not in ("0", "false", "False")
+STATE_FILE = Path(_env("STATE_FILE", "state/last-run.json"))
 
 # Article body sent to the LLM — keep prompt under typical context comfort
 _MAX_ARTICLE_CHARS = 6000
 
 http = httpx.Client(timeout=httpx.Timeout(30.0, read=180.0))
+
+
+def to_ghost_filter_date(when: datetime) -> str:
+    return when.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+
+
+def read_last_run() -> datetime | None:
+    if not STATE_FILE.exists():
+        return None
+    try:
+        data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+        raw = data.get("lastRunAt")
+        if not raw:
+            return None
+        parsed = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+        return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+    except (json.JSONDecodeError, OSError, ValueError, TypeError):
+        log.warning("invalid state file %s — treating as first run", STATE_FILE)
+        return None
+
+
+def write_last_run(when: datetime) -> None:
+    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    payload = {"lastRunAt": to_ghost_filter_date(when)}
+    STATE_FILE.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 
 
 class _TextExtractor(HTMLParser):
@@ -123,7 +152,9 @@ def _ghost(method: str, path: str, **kwargs: Any) -> dict[str, Any]:
     return response.json()
 
 
-def list_drafts() -> list[dict[str, Any]]:
+def list_drafts(since: datetime) -> list[dict[str, Any]]:
+    since_iso = to_ghost_filter_date(since)
+    post_filter = f"status:draft+updated_at:>'{since_iso}'"
     posts: list[dict[str, Any]] = []
     page = 1
     while True:
@@ -131,9 +162,9 @@ def list_drafts() -> list[dict[str, Any]]:
             "GET",
             "posts/",
             params={
-                "filter": "status:draft",
+                "filter": post_filter,
                 "formats": "html",
-                "order": "updated_at desc",
+                "order": "updated_at asc",
                 "limit": 50,
                 "page": page,
             },
@@ -298,8 +329,25 @@ def run() -> dict[str, Any]:
         if not value:
             raise RuntimeError(f"Missing {name}")
 
-    drafts = list_drafts()
-    log.info("found %s draft(s)", len(drafts))
+    run_started_at = datetime.now(timezone.utc)
+    last_run_at = read_last_run()
+    if last_run_at is None:
+        log.info("first run — no state yet, baseline only (no drafts processed)")
+        write_last_run(run_started_at)
+        return {
+            "since": None,
+            "first_run": True,
+            "drafts": 0,
+            "updated": 0,
+            "skipped": 0,
+            "errors": 0,
+            "results": [],
+        }
+
+    since_iso = to_ghost_filter_date(last_run_at)
+    log.info("collecting drafts updated after %s", since_iso)
+    drafts = list_drafts(last_run_at)
+    log.info("found %s draft(s) in window", len(drafts))
     results: list[dict[str, Any]] = []
     for i, post in enumerate(drafts):
         try:
@@ -309,14 +357,22 @@ def run() -> dict[str, Any]:
         except Exception as exc:
             log.exception("post %s failed", post.get("id"))
             results.append({"id": post.get("id"), "title": post.get("title"), "error": str(exc)})
-        # Bonsai Space asks to avoid automated bursts
         if i + 1 < len(drafts):
             time.sleep(2)
+
+    errors = sum(1 for r in results if r.get("error"))
+    if errors:
+        log.warning("not updating last-run — %s error(s), will retry same window next run", errors)
+    else:
+        write_last_run(run_started_at)
+
     return {
+        "since": since_iso,
+        "first_run": False,
         "drafts": len(drafts),
         "updated": sum(1 for r in results if r.get("updated")),
         "skipped": sum(1 for r in results if r.get("skipped")),
-        "errors": sum(1 for r in results if r.get("error")),
+        "errors": errors,
         "results": results,
     }
 
@@ -328,6 +384,8 @@ def _self_check() -> None:
     assert html_to_text("<p>Hello <b>world</b></p><script>x</script>") == "Hello world"
     assert needs_prep({"custom_excerpt": "", "feature_image": None}) is True
     assert needs_prep({"custom_excerpt": "x", "feature_image": "https://x/y.png"}) is False
+    when = datetime(2026, 7, 17, 6, 0, 0, tzinfo=timezone.utc)
+    assert to_ghost_filter_date(when) == "2026-07-17T06:00:00.000Z"
     log.info("self-check ok")
 
 

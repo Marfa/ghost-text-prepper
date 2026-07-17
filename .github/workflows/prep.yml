@@ -6,6 +6,9 @@ on:
     - cron: "0 6 * * *"
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   prep:
     runs-on: ubuntu-latest
@@ -37,3 +40,8 @@ jobs:
           MAX_EXCERPT_LEN: "146"
           SKIP_COMPLETE: "1"
         run: python app.py
+
+      - uses: stefanzweifel/git-auto-commit-action@v7
+        with:
+          commit_message: "chore: update last-run timestamp"
+          file_pattern: state/last-run.json

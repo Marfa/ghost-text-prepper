@@ -1,9 +1,9 @@
 name: Daily draft prep
 
 on:
-  schedule:
-    # Once per day, 06:00 UTC
-    - cron: "0 6 * * *"
+  # schedule paused — re-enable when ready:
+  # schedule:
+  #   - cron: "0 6 * * *"
   workflow_dispatch:
 
 permissions:

@@ -1,4 +1,4 @@
-"""Prep Ghost draft posts: HF excerpt + Bonsai feature image."""
+"""Prep Ghost draft posts: short SEO/social excerpt via Hugging Face."""
 
 from __future__ import annotations
 
@@ -10,7 +10,6 @@ import re
 import time
 from datetime import datetime, timezone
 from html.parser import HTMLParser
-from io import BytesIO
 from pathlib import Path
 from typing import Any, Optional
 
@@ -32,14 +31,6 @@ GHOST_URL = _env("GHOST_URL").rstrip("/").removesuffix("/ghost")
 GHOST_KEY = _env("GHOST_ADMIN_API_KEY")
 HF_TOKEN = _env("HF_TOKEN")
 HF_TEXT_MODEL = _env("HF_TEXT_MODEL", "Qwen/Qwen2.5-7B-Instruct")
-
-BONSAI_URL = _env("BONSAI_URL", "https://prism-ml-bonsai-image-demo.hf.space").rstrip("/")
-BONSAI_BACKEND = _env("BONSAI_BACKEND", "bonsai-ternary-gemlite")
-BONSAI_SEED = int(_env("BONSAI_SEED", "42"))
-BONSAI_STEPS = int(_env("BONSAI_STEPS", "4"))
-BONSAI_WIDTH = int(_env("BONSAI_WIDTH", "1248"))
-BONSAI_HEIGHT = int(_env("BONSAI_HEIGHT", "832"))
-BONSAI_TOKEN = _env("BONSAI_TOKEN")
 
 MAX_EXCERPT_LEN = int(_env("MAX_EXCERPT_LEN", "146"))
 SKIP_COMPLETE = _env("SKIP_COMPLETE", "1") not in ("0", "false", "False")
@@ -119,9 +110,7 @@ def truncate_excerpt(text: str, limit: int = MAX_EXCERPT_LEN) -> str:
 def needs_prep(post: dict[str, Any]) -> bool:
     if not SKIP_COMPLETE:
         return True
-    has_excerpt = bool((post.get("custom_excerpt") or "").strip())
-    has_image = bool(post.get("feature_image"))
-    return not (has_excerpt and has_image)
+    return not bool((post.get("custom_excerpt") or "").strip())
 
 
 def _ghost_token(admin_key: str) -> str:
@@ -177,25 +166,6 @@ def list_drafts(since: datetime) -> list[dict[str, Any]]:
     return posts
 
 
-def upload_image(png_bytes: bytes, filename: str) -> str:
-    response = http.post(
-        f"{GHOST_URL}/ghost/api/admin/images/upload/",
-        headers={
-            "Authorization": f"Ghost {_ghost_token(GHOST_KEY)}",
-            "Accept-Version": "v5.0",
-        },
-        files={"file": (filename, BytesIO(png_bytes), "image/png")},
-        data={"purpose": "image", "ref": filename},
-    )
-    if response.is_error:
-        log.error("ghost image upload → %s %s", response.status_code, response.text[:500])
-    response.raise_for_status()
-    images = response.json().get("images") or []
-    if not images or not images[0].get("url"):
-        raise RuntimeError("Ghost image upload returned no url")
-    return images[0]["url"]
-
-
 def update_post(post_id: str, updated_at: str, fields: dict[str, Any]) -> dict[str, Any]:
     payload = {"posts": [{**fields, "updated_at": updated_at}]}
     return _ghost("PUT", f"posts/{post_id}/", json=payload)["posts"][0]
@@ -231,39 +201,6 @@ def generate_excerpt(title: str, body: str) -> str:
     return truncate_excerpt(text)
 
 
-def image_prompt_from_title(title: str) -> str:
-    # ponytail: no second LLM call — HF is only used for excerpt
-    clean = re.sub(r"\s+", " ", (title or "blog topic").strip())[:200]
-    return (
-        f"Editorial photograph about: {clean}. "
-        "Single coherent scene, photorealistic or clean illustration, "
-        "no text, no letters, no logos, no watermark, no UI"
-    )
-
-
-def generate_image(prompt: str) -> bytes:
-    headers = {"Content-Type": "application/json"}
-    if BONSAI_TOKEN:
-        headers["Authorization"] = f"Bearer {BONSAI_TOKEN}"
-    payload = {
-        "prompt": prompt,
-        "seed": BONSAI_SEED,
-        "steps": BONSAI_STEPS,
-        "backend": BONSAI_BACKEND,
-        "width": BONSAI_WIDTH,
-        "height": BONSAI_HEIGHT,
-        "guidance": 1.0,
-    }
-    response = http.post(f"{BONSAI_URL}/generate", headers=headers, json=payload)
-    if response.is_error:
-        log.error("bonsai generate → %s %s", response.status_code, response.text[:500])
-    response.raise_for_status()
-    ctype = response.headers.get("content-type", "")
-    if "image" not in ctype and not response.content.startswith(b"\x89PNG"):
-        raise RuntimeError(f"Bonsai returned non-image content-type={ctype!r}")
-    return response.content
-
-
 def process_post(post: dict[str, Any]) -> dict[str, Any]:
     post_id = post["id"]
     title = post.get("title") or "Untitled"
@@ -274,36 +211,19 @@ def process_post(post: dict[str, Any]) -> dict[str, Any]:
     if not needs_prep(post):
         return {"id": post_id, "title": title, "skipped": True, "reason": "already complete"}
 
-    fields: dict[str, Any] = {}
-    excerpt = (post.get("custom_excerpt") or "").strip()
-    if not excerpt:
-        excerpt = generate_excerpt(title, body)
-        fields["custom_excerpt"] = excerpt
-        fields["meta_description"] = excerpt
-        fields["og_description"] = excerpt
-        fields["twitter_description"] = excerpt
-
-    image_url = post.get("feature_image")
-    if not image_url:
-        prompt = image_prompt_from_title(title)
-        log.info("image prompt for %s: %s", post_id, prompt[:160])
-        png = generate_image(prompt)
-        slug = re.sub(r"[^a-z0-9]+", "-", (post.get("slug") or post_id).lower()).strip("-") or post_id
-        image_url = upload_image(png, f"prep-{slug}.png")
-        fields["feature_image"] = image_url
-        fields["og_image"] = image_url
-        fields["twitter_image"] = image_url
-
-    if not fields:
-        return {"id": post_id, "title": title, "skipped": True, "reason": "nothing to update"}
-
+    excerpt = generate_excerpt(title, body)
+    fields = {
+        "custom_excerpt": excerpt,
+        "meta_description": excerpt,
+        "og_description": excerpt,
+        "twitter_description": excerpt,
+    }
     saved = update_post(post_id, post["updated_at"], fields)
     return {
         "id": post_id,
         "title": title,
         "updated": True,
-        "excerpt": fields.get("custom_excerpt") or excerpt,
-        "image": fields.get("feature_image") or image_url,
+        "excerpt": excerpt,
         "slug": saved.get("slug"),
     }
 
@@ -346,7 +266,7 @@ def run() -> dict[str, Any]:
             log.exception("post %s failed", post.get("id"))
             results.append({"id": post.get("id"), "title": post.get("title"), "error": str(exc)})
         if i + 1 < len(drafts):
-            time.sleep(2)
+            time.sleep(1)
 
     errors = sum(1 for r in results if r.get("error"))
     if errors:
@@ -370,11 +290,10 @@ def _self_check() -> None:
     assert len(truncate_excerpt("word " * 50, 146)) <= 146
     assert "…" in truncate_excerpt("alpha beta gamma delta", 12)
     assert html_to_text("<p>Hello <b>world</b></p><script>x</script>") == "Hello world"
-    assert needs_prep({"custom_excerpt": "", "feature_image": None}) is True
-    assert needs_prep({"custom_excerpt": "x", "feature_image": "https://x/y.png"}) is False
+    assert needs_prep({"custom_excerpt": ""}) is True
+    assert needs_prep({"custom_excerpt": "x"}) is False
     when = datetime(2026, 7, 17, 6, 0, 0, tzinfo=timezone.utc)
     assert to_ghost_filter_date(when) == "2026-07-17T06:00:00.000Z"
-    assert "no text" in image_prompt_from_title("VPN обзор")
     log.info("self-check ok")
 
 

@@ -1,14 +1,12 @@
 # Ghost Text Prepper
 
-Раз в сутки обрабатывает **новые** черновики Ghost: краткий excerpt (≤146) через Hugging Face и feature image через Bonsai.
+Раз в сутки пишет короткие SEO/social-описания (≤146 символов) для **новых** черновиков Ghost через Hugging Face.
 
-## Текст (HF)
+## Текст
 
-**[Qwen/Qwen2.5-7B-Instruct](https://huggingface.co/Qwen/Qwen2.5-7B-Instruct)** — только для `custom_excerpt` / meta / og / twitter description. Нужен `HF_TOKEN`.
+**[Qwen/Qwen2.5-7B-Instruct](https://huggingface.co/Qwen/Qwen2.5-7B-Instruct)** → `custom_excerpt`, `meta_description`, `og_description`, `twitter_description`.
 
-## Картинки (Bonsai)
-
-[prism-ml/Bonsai-Image-Demo](https://huggingface.co/spaces/prism-ml/Bonsai-Image-Demo): Ternary, `1248×832`, seed `42`, steps `4`. Промпт строится из заголовка (без второго LLM-вызова).
+Нужен `HF_TOKEN`.
 
 ## Запуск
 
@@ -22,7 +20,7 @@ python app.py
 
 ## Инкрементальный режим
 
-`state/last-run.json` хранит `lastRunAt`. Берутся только черновики с `updated_at` **после** этой метки. Первый прогон / свежий baseline ничего не обрабатывает — только фиксирует точку отсчёта.
+`state/last-run.json` — только черновики с `updated_at` после `lastRunAt`. Свежий baseline ничего не обрабатывает.
 
 ## Автоматизация
 

@@ -30,13 +30,6 @@ jobs:
           GHOST_ADMIN_API_KEY: ${{ secrets.GHOST_ADMIN_API_KEY }}
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           HF_TEXT_MODEL: ${{ vars.HF_TEXT_MODEL }}
-          BONSAI_URL: ${{ vars.BONSAI_URL }}
-          BONSAI_BACKEND: ${{ vars.BONSAI_BACKEND }}
-          BONSAI_SEED: ${{ vars.BONSAI_SEED }}
-          BONSAI_STEPS: ${{ vars.BONSAI_STEPS }}
-          BONSAI_WIDTH: ${{ vars.BONSAI_WIDTH }}
-          BONSAI_HEIGHT: ${{ vars.BONSAI_HEIGHT }}
-          BONSAI_TOKEN: ${{ secrets.BONSAI_TOKEN }}
           MAX_EXCERPT_LEN: "146"
           SKIP_COMPLETE: "1"
         run: python app.py

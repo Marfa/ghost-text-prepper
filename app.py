@@ -1,4 +1,4 @@
-"""Prep Ghost draft posts: short SEO/social excerpt via Hugging Face."""
+"""Prep Ghost draft posts: strip AI Unicode marks, then SEO/social excerpt."""
 
 from __future__ import annotations
 
@@ -8,6 +8,7 @@ import logging
 import os
 import re
 import time
+import unicodedata
 from datetime import datetime, timezone
 from html.parser import HTMLParser
 from pathlib import Path
@@ -97,6 +98,66 @@ def html_to_text(raw_html: str) -> str:
     return parser.text()
 
 
+# Layer A Unicode carriers from guillaumemeyer/watermarks-remover (MIT).
+# ponytail: lossless scrub only. Layer B paraphrase would rewrite the post;
+# image C2PA needs Ghost re-upload. Upgrade: HF rewrite + image round-trip.
+_STRIP_CPS = frozenset(
+    {
+        0x00AD, 0x034F, 0x061C, 0x115F, 0x1160, 0x17B4, 0x17B5,
+        0x180B, 0x180C, 0x180D, 0x180E,
+        0x200B, 0x200C, 0x200D, 0x200E, 0x200F,
+        0x202A, 0x202B, 0x202C, 0x202D, 0x202E,
+        0x2060, 0x2061, 0x2062, 0x2063, 0x2064,
+        0x2066, 0x2067, 0x2068, 0x2069, 0x206A, 0x206B, 0x206C, 0x206D, 0x206E, 0x206F,
+        0xFEFF,
+        *range(0xFE00, 0xFE10),
+        0xFFF9, 0xFFFA, 0xFFFB,
+    }
+)
+_EMOJI_GLUE = frozenset({0x200D, 0xFE0E, 0xFE0F})
+_DATA_AI_ATTR = re.compile(r"\sdata-ai[\w-]*\s*=\s*[\"'][^\"']*[\"']", re.I)
+
+
+def _is_emoji_base(cp: int) -> bool:
+    if 0x1F000 <= cp <= 0x1FAFF or 0x2600 <= cp <= 0x27BF or 0x2B00 <= cp <= 0x2BFF:
+        return True
+    if cp in (0x00A9, 0x00AE, 0x2122, 0x3030, 0x303D, 0x3297, 0x3299, 0x0023, 0x002A):
+        return True
+    return 0x0030 <= cp <= 0x0039
+
+
+def _is_mark_cp(cp: int) -> bool:
+    if cp in _STRIP_CPS:
+        return True
+    if 0xE0100 <= cp <= 0xE01EF or 0xE0001 <= cp <= 0xE007F:
+        return True
+    return unicodedata.category(chr(cp)) == "Cf"
+
+
+def scrub_ai_marks(text: str) -> tuple[str, int]:
+    """Strip invisible Unicode watermarks. Keep emoji ZWJ/VS and NBSP."""
+    out: list[str] = []
+    prev: str | None = None
+    removed = 0
+    for ch in text or "":
+        cp = ord(ch)
+        if cp in _EMOJI_GLUE and prev is not None and _is_emoji_base(ord(prev)):
+            out.append(ch)
+            continue
+        if _is_mark_cp(cp):
+            removed += 1
+            continue
+        out.append(ch)
+        prev = ch
+    return "".join(out), removed
+
+
+def scrub_post_html(raw_html: str) -> tuple[str, int]:
+    cleaned, removed = scrub_ai_marks(raw_html or "")
+    cleaned, n_attr = _DATA_AI_ATTR.subn("", cleaned)
+    return cleaned, removed + n_attr
+
+
 def truncate_excerpt(text: str, limit: int = MAX_EXCERPT_LEN) -> str:
     text = re.sub(r"\s+", " ", (text or "").strip().strip("\"'"))
     if len(text) <= limit:
@@ -107,7 +168,7 @@ def truncate_excerpt(text: str, limit: int = MAX_EXCERPT_LEN) -> str:
     return cut.rstrip(".,;:!-—") + "…"
 
 
-def needs_prep(post: dict[str, Any]) -> bool:
+def needs_excerpt(post: dict[str, Any]) -> bool:
     if not SKIP_COMPLETE:
         return True
     return not bool((post.get("custom_excerpt") or "").strip())
@@ -168,7 +229,10 @@ def list_drafts(since: datetime) -> list[dict[str, Any]]:
 
 def update_post(post_id: str, updated_at: str, fields: dict[str, Any]) -> dict[str, Any]:
     payload = {"posts": [{**fields, "updated_at": updated_at}]}
-    return _ghost("PUT", f"posts/{post_id}/", json=payload)["posts"][0]
+    kwargs: dict[str, Any] = {"json": payload}
+    if "html" in fields:
+        kwargs["params"] = {"source": "html"}
+    return _ghost("PUT", f"posts/{post_id}/", **kwargs)["posts"][0]
 
 
 def _hf_client() -> InferenceClient:
@@ -204,28 +268,49 @@ def generate_excerpt(title: str, body: str) -> str:
 def process_post(post: dict[str, Any]) -> dict[str, Any]:
     post_id = post["id"]
     title = post.get("title") or "Untitled"
-    body = html_to_text(post.get("html") or "")
-    if len(body) < 40:
-        return {"id": post_id, "title": title, "skipped": True, "reason": "body too short"}
+    html_raw = post.get("html") or ""
+    html_clean, html_marks = scrub_post_html(html_raw)
+    title_clean, title_marks = scrub_ai_marks(title)
+    marks_removed = html_marks + title_marks
+    body = html_to_text(html_clean)
+    excerpt_needed = needs_excerpt(post)
 
-    if not needs_prep(post):
+    if len(body) < 40 and not marks_removed:
+        return {"id": post_id, "title": title, "skipped": True, "reason": "body too short"}
+    if not excerpt_needed and not marks_removed:
         return {"id": post_id, "title": title, "skipped": True, "reason": "already complete"}
 
-    excerpt = generate_excerpt(title, body)
-    fields = {
-        "custom_excerpt": excerpt,
-        "meta_description": excerpt,
-        "og_description": excerpt,
-        "twitter_description": excerpt,
-    }
+    fields: dict[str, Any] = {}
+    excerpt = ""
+    if excerpt_needed and len(body) >= 40:
+        excerpt = generate_excerpt(title_clean, body)
+        fields.update(
+            {
+                "custom_excerpt": excerpt,
+                "meta_description": excerpt,
+                "og_description": excerpt,
+                "twitter_description": excerpt,
+            }
+        )
+    if html_clean != html_raw:
+        fields["html"] = html_clean
+    if title_clean != title:
+        fields["title"] = title_clean
+    if not fields:
+        return {"id": post_id, "title": title, "skipped": True, "reason": "already complete"}
+
     saved = update_post(post_id, post["updated_at"], fields)
-    return {
+    result: dict[str, Any] = {
         "id": post_id,
-        "title": title,
+        "title": title_clean,
         "updated": True,
-        "excerpt": excerpt,
         "slug": saved.get("slug"),
     }
+    if excerpt:
+        result["excerpt"] = excerpt
+    if marks_removed:
+        result["marks_removed"] = marks_removed
+    return result
 
 
 def run() -> dict[str, Any]:
@@ -290,10 +375,16 @@ def _self_check() -> None:
     assert len(truncate_excerpt("word " * 50, 146)) <= 146
     assert "…" in truncate_excerpt("alpha beta gamma delta", 12)
     assert html_to_text("<p>Hello <b>world</b></p><script>x</script>") == "Hello world"
-    assert needs_prep({"custom_excerpt": ""}) is True
-    assert needs_prep({"custom_excerpt": "x"}) is False
+    assert needs_excerpt({"custom_excerpt": ""}) is True
+    assert needs_excerpt({"custom_excerpt": "x"}) is False
     when = datetime(2026, 7, 17, 6, 0, 0, tzinfo=timezone.utc)
     assert to_ghost_filter_date(when) == "2026-07-17T06:00:00.000Z"
+    assert scrub_ai_marks("Hello\u200b world") == ("Hello world", 1)
+    assert scrub_ai_marks("a\u00a0b") == ("a\u00a0b", 0)
+    family = "👨‍👩‍👧"
+    assert scrub_ai_marks(family) == (family, 0)
+    html_out, n = scrub_post_html('<p data-ai-generated="yes">Hi\u200b</p>')
+    assert n == 2 and "data-ai" not in html_out and "\u200b" not in html_out
     log.info("self-check ok")
 
 

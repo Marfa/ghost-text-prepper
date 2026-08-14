@@ -1,12 +1,21 @@
 # Ghost Text Prepper
 
-Раз в сутки пишет короткие SEO/social-описания (≤146 символов) для **новых** черновиков Ghost через Hugging Face.
+Раз в сутки чистит AI-пометки в черновиках Ghost и пишет короткие SEO/social-описания (≤146 символов) через Hugging Face.
 
-## Текст
+```bash
+python app.py
+```
 
-**[Qwen/Qwen2.5-7B-Instruct](https://huggingface.co/Qwen/Qwen2.5-7B-Instruct)** → `custom_excerpt`, `meta_description`, `og_description`, `twitter_description`.
+Черновик на выходе без невидимого Unicode (ZWSP, bidi, tag chars) и `data-ai*` — плюс готовый excerpt.
 
-Нужен `HF_TOKEN`.
+## Что делает
+
+| Шаг | Результат |
+| --- | --- |
+| [watermarks-remover](https://github.com/guillaumemeyer/watermarks-remover) Layer A | С тела и заголовка снимаются невидимые Unicode-пометки и `data-ai*` |
+| [Qwen/Qwen2.5-7B-Instruct](https://huggingface.co/Qwen/Qwen2.5-7B-Instruct) | `custom_excerpt`, `meta_description`, `og_description`, `twitter_description` |
+
+Нужен `HF_TOKEN`. Текст поста не переписывается (Layer B / paraphrase выключен: это ломает тон). Картинки и C2PA не трогаются.
 
 ## Запуск
 
@@ -22,6 +31,8 @@ python app.py
 
 `state/last-run.json` — только черновики с `updated_at` после `lastRunAt`. Свежий baseline ничего не обрабатывает.
 
+Посты с уже заполненным excerpt всё равно чистятся, если в HTML/заголовке есть пометки.
+
 ## Автоматизация
 
 GitHub Actions: cron `0 6 * * *` UTC + `workflow_dispatch`.
@@ -33,6 +44,8 @@ Secrets: `GHOST_URL`, `GHOST_ADMIN_API_KEY`, `HF_TOKEN`.
 [CC BY-NC-SA 4.0 International](https://creativecommons.org/licenses/by-nc-sa/4.0/) — см. [LICENSE](LICENSE).
 
 Некоммерческое использование; производные работы — с тем же лицензированием; указание авторства обязательно.
+
+Layer A Unicode-таблицы — [watermarks-remover](https://github.com/guillaumemeyer/watermarks-remover) (MIT).
 
 ## Авторство и поддержка
 

@@ -36,6 +36,7 @@ HF_TEXT_MODEL = _env("HF_TEXT_MODEL", "Qwen/Qwen2.5-7B-Instruct")
 MAX_EXCERPT_LEN = int(_env("MAX_EXCERPT_LEN", "146"))
 SKIP_COMPLETE = _env("SKIP_COMPLETE", "1") not in ("0", "false", "False")
 STATE_FILE = Path(_env("STATE_FILE", "state/last-run.json"))
+TAG_STATE_FILE = Path(_env("TAG_STATE_FILE", "state/current-tag.json"))
 
 _MAX_ARTICLE_CHARS = 6000
 
@@ -65,6 +66,139 @@ def write_last_run(when: datetime) -> None:
     STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
     payload = {"lastRunAt": to_ghost_filter_date(when)}
     STATE_FILE.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+
+
+def read_current_tag_slug() -> str | None:
+    if not TAG_STATE_FILE.exists():
+        return None
+    try:
+        data = json.loads(TAG_STATE_FILE.read_text(encoding="utf-8"))
+        slug = (data.get("currentTagSlug") or "").strip()
+        return slug or None
+    except (json.JSONDecodeError, OSError, TypeError):
+        log.warning("invalid tag state file %s — treating as unset", TAG_STATE_FILE)
+        return None
+
+
+def write_current_tag_slug(slug: str) -> None:
+    TAG_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    payload = {"currentTagSlug": slug}
+    TAG_STATE_FILE.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+
+
+def admin_tag_posts_url(slug: str) -> str:
+    return f"{GHOST_URL}/ghost/#/posts?tag={slug}"
+
+
+def list_tags() -> list[dict[str, Any]]:
+    tags: list[dict[str, Any]] = []
+    page = 1
+    while True:
+        data = _ghost(
+            "GET",
+            "tags/",
+            params={"order": "name asc", "limit": 100, "page": page},
+        )
+        tags.extend(data["tags"])
+        pagination = data.get("meta", {}).get("pagination", {})
+        if page >= pagination.get("pages", 1):
+            break
+        page += 1
+    return tags
+
+
+def resolve_tag_slug(raw: str, tags: list[dict[str, Any]]) -> str | None:
+    needle = raw.strip()
+    if not needle:
+        return None
+    by_slug = {t["slug"]: t for t in tags}
+    if needle in by_slug:
+        return needle
+    lowered = needle.casefold()
+    for tag in tags:
+        if tag.get("name", "").casefold() == lowered:
+            return tag["slug"]
+    return None
+
+
+def next_tag_after(current_slug: str | None, tags: list[dict[str, Any]]) -> dict[str, Any]:
+    if not tags:
+        raise RuntimeError("Ghost returned no tags")
+    ordered = sorted(tags, key=lambda t: t.get("name", "").casefold())
+    if current_slug is None:
+        return ordered[0]
+    slugs = [t["slug"] for t in ordered]
+    if current_slug not in slugs:
+        log.warning("current tag slug %r not in Ghost — using first tag", current_slug)
+        return ordered[0]
+    idx = slugs.index(current_slug)
+    return ordered[(idx + 1) % len(ordered)]
+
+
+def run_tag_rotation(
+    *,
+    set_current_slug: str | None = None,
+    set_only: bool = False,
+) -> dict[str, Any]:
+    if set_only and not set_current_slug:
+        raise RuntimeError("--set-only requires --set-current-tag")
+
+    for name, value in {"GHOST_URL": GHOST_URL, "GHOST_ADMIN_API_KEY": GHOST_KEY}.items():
+        if not value:
+            raise RuntimeError(f"Missing {name}")
+
+    tags = list_tags()
+    stored_slug = read_current_tag_slug()
+    current_slug = stored_slug
+
+    if set_current_slug:
+        resolved = resolve_tag_slug(set_current_slug, tags)
+        if not resolved:
+            known = ", ".join(t["slug"] for t in tags[:20])
+            raise RuntimeError(f"Unknown tag {set_current_slug!r} (sample slugs: {known})")
+        current_slug = resolved
+        write_current_tag_slug(resolved)
+        log.info("current tag set to %s", resolved)
+        if set_only:
+            tag = next(t for t in tags if t["slug"] == resolved)
+            return {
+                "mode": "set_only",
+                "current": {"name": tag["name"], "slug": tag["slug"]},
+                "postsUrl": admin_tag_posts_url(tag["slug"]),
+                "nextWouldBe": next_tag_after(resolved, tags),
+            }
+
+    suggested = next_tag_after(current_slug, tags)
+    write_current_tag_slug(suggested["slug"])
+    return {
+        "mode": "rotate",
+        "previousSlug": current_slug,
+        "suggested": {
+            "name": suggested["name"],
+            "slug": suggested["slug"],
+            "postsUrl": admin_tag_posts_url(suggested["slug"]),
+        },
+    }
+
+
+def format_tag_rotation_summary(result: dict[str, Any]) -> str:
+    if result.get("mode") == "set_only":
+        current = result["current"]
+        nxt = result["nextWouldBe"]
+        return (
+            f"## Current tag updated\n\n"
+            f"**{current['name']}** (`{current['slug']}`)\n\n"
+            f"[Posts]({result['postsUrl']})\n\n"
+            f"Next rotation will suggest **{nxt['name']}** (`{nxt['slug']}`)."
+        )
+    suggested = result["suggested"]
+    prev = result.get("previousSlug") or "(none)"
+    return (
+        f"## Suggested tag\n\n"
+        f"**{suggested['name']}** (`{suggested['slug']}`)\n\n"
+        f"[Open posts in Ghost Admin]({suggested['postsUrl']})\n\n"
+        f"Previous current tag: `{prev}`"
+    )
 
 
 class _TextExtractor(HTMLParser):
@@ -385,23 +519,62 @@ def _self_check() -> None:
     assert scrub_ai_marks(family) == (family, 0)
     html_out, n = scrub_post_html('<p data-ai-generated="yes">Hi\u200b</p>')
     assert n == 2 and "data-ai" not in html_out and "\u200b" not in html_out
+    sample_tags = [
+        {"name": "Actiondesk", "slug": "actiondesk"},
+        {"name": "Active@ Partition Manager", "slug": "active-partition-manager"},
+        {"name": "Zeta", "slug": "zeta"},
+    ]
+    nxt = next_tag_after("actiondesk", sample_tags)
+    assert nxt["slug"] == "active-partition-manager"
+    assert next_tag_after("zeta", sample_tags)["slug"] == "actiondesk"
+    assert resolve_tag_slug("Active@ Partition Manager", sample_tags) == "active-partition-manager"
     log.info("self-check ok")
 
 
 if __name__ == "__main__":
+    import argparse
     import sys
 
-    if len(sys.argv) > 1 and sys.argv[1] == "--self-check":
+    parser = argparse.ArgumentParser(description="Ghost draft prep and tag rotation")
+    parser.add_argument("--self-check", action="store_true", help="run helper self-check only")
+    parser.add_argument("--tag-rotate", action="store_true", help="suggest next Ghost tag")
+    parser.add_argument(
+        "--set-current-tag",
+        metavar="SLUG_OR_NAME",
+        help="set current tag (slug or exact name); use with --set-only to skip rotation",
+    )
+    parser.add_argument(
+        "--set-only",
+        action="store_true",
+        help="with --set-current-tag, update state without advancing to the next tag",
+    )
+    args = parser.parse_args()
+
+    if args.self_check:
         _self_check()
-    else:
+        sys.exit(0)
+
+    if args.tag_rotate or args.set_current_tag:
         _self_check()
-        summary = run()
-        log.info(
-            "done: drafts=%s updated=%s skipped=%s errors=%s",
-            summary["drafts"],
-            summary["updated"],
-            summary["skipped"],
-            summary["errors"],
+        result = run_tag_rotation(
+            set_current_slug=args.set_current_tag,
+            set_only=args.set_only,
         )
-        if summary["errors"]:
-            sys.exit(1)
+        summary_md = format_tag_rotation_summary(result)
+        log.info("%s", summary_md.replace("## ", "").replace("**", "").replace("\n\n", "\n"))
+        summary_path = os.getenv("GITHUB_STEP_SUMMARY")
+        if summary_path:
+            Path(summary_path).write_text(summary_md + "\n", encoding="utf-8")
+        sys.exit(0)
+
+    _self_check()
+    summary = run()
+    log.info(
+        "done: drafts=%s updated=%s skipped=%s errors=%s",
+        summary["drafts"],
+        summary["updated"],
+        summary["skipped"],
+        summary["errors"],
+    )
+    if summary["errors"]:
+        sys.exit(1)

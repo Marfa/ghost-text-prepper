@@ -1,0 +1,49 @@
+name: Next Ghost tag
+
+on:
+  workflow_dispatch:
+    inputs:
+      set_current_tag:
+        description: "Set current tag (slug or name); next run suggests the tag after it"
+        required: false
+        type: string
+      set_only:
+        description: "Only update current tag, do not advance to the next one"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  next-tag:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      - name: Suggest next tag
+        env:
+          GHOST_URL: ${{ secrets.GHOST_URL }}
+          GHOST_ADMIN_API_KEY: ${{ secrets.GHOST_ADMIN_API_KEY }}
+        run: |
+          args=(--tag-rotate)
+          if [ -n "${{ inputs.set_current_tag }}" ]; then
+            args+=(--set-current-tag "${{ inputs.set_current_tag }}")
+          fi
+          if [ "${{ inputs.set_only }}" = "true" ]; then
+            args+=(--set-only)
+          fi
+          python app.py "${args[@]}"
+
+      - uses: stefanzweifel/git-auto-commit-action@v7
+        with:
+          commit_message: "chore: update current Ghost tag"
+          file_pattern: state/current-tag.json

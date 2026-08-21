@@ -90,6 +90,15 @@ def admin_tag_posts_url(slug: str) -> str:
     return f"{GHOST_URL}/ghost/#/posts?tag={slug}"
 
 
+def html_blank_link(url: str, label: str) -> str:
+    """Job Summary link: absolute URL + new tab (Markdown + secret masking breaks # URLs)."""
+    return (
+        f'<a href="{html.escape(url, quote=True)}" '
+        f'target="_blank" rel="noopener noreferrer">'
+        f"{html.escape(label)}</a>"
+    )
+
+
 def list_tags() -> list[dict[str, Any]]:
     tags: list[dict[str, Any]] = []
     page = 1
@@ -188,7 +197,7 @@ def format_tag_rotation_summary(result: dict[str, Any]) -> str:
         return (
             f"## Current tag updated\n\n"
             f"**{current['name']}** (`{current['slug']}`)\n\n"
-            f"[Posts]({result['postsUrl']})\n\n"
+            f"{html_blank_link(result['postsUrl'], 'Open posts in Ghost Admin')}\n\n"
             f"Next rotation will suggest **{nxt['name']}** (`{nxt['slug']}`)."
         )
     suggested = result["suggested"]
@@ -196,7 +205,7 @@ def format_tag_rotation_summary(result: dict[str, Any]) -> str:
     return (
         f"## Suggested tag\n\n"
         f"**{suggested['name']}** (`{suggested['slug']}`)\n\n"
-        f"[Open posts in Ghost Admin]({suggested['postsUrl']})\n\n"
+        f"{html_blank_link(suggested['postsUrl'], 'Open posts in Ghost Admin')}\n\n"
         f"Previous current tag: `{prev}`"
     )
 
@@ -528,6 +537,13 @@ def _self_check() -> None:
     assert nxt["slug"] == "active-partition-manager"
     assert next_tag_after("zeta", sample_tags)["slug"] == "actiondesk"
     assert resolve_tag_slug("Active@ Partition Manager", sample_tags) == "active-partition-manager"
+    link = html_blank_link(
+        "https://example.com/ghost/#/posts?tag=x",
+        "Open posts in Ghost Admin",
+    )
+    assert 'href="https://example.com/ghost/#/posts?tag=x"' in link
+    assert 'target="_blank"' in link
+    assert "rel=" in link and "noopener" in link
     log.info("self-check ok")
 
 

@@ -37,7 +37,7 @@ python app.py
 
 GitHub Actions: cron `0 6 * * *` UTC + `workflow_dispatch`.
 
-Secrets: `GHOST_URL`, `GHOST_ADMIN_API_KEY`, `HF_TOKEN`.
+Secrets: `GHOST_ADMIN_API_KEY`, `HF_TOKEN`. Variable: `GHOST_URL` (публичный URL сайта — не секрет, иначе Job Summary маскирует ссылки).
 
 ## Лицензия
 

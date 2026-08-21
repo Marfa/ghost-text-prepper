@@ -31,7 +31,8 @@ jobs:
 
       - name: Suggest next tag
         env:
-          GHOST_URL: ${{ secrets.GHOST_URL }}
+          # Public site URL must be a variable — secrets are masked in Job Summary and break links.
+          GHOST_URL: ${{ vars.GHOST_URL }}
           GHOST_ADMIN_API_KEY: ${{ secrets.GHOST_ADMIN_API_KEY }}
         run: |
           args=(--tag-rotate)

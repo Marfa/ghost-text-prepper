@@ -1,5 +1,4 @@
 .env
-.cursor/
 .venv/
 .venv*/
 venv/

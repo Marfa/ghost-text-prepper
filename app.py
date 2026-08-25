@@ -31,7 +31,7 @@ def _env(name: str, default: str = "") -> str:
 GHOST_URL = _env("GHOST_URL").rstrip("/").removesuffix("/ghost")
 GHOST_KEY = _env("GHOST_ADMIN_API_KEY")
 HF_TOKEN = _env("HF_TOKEN")
-HF_TEXT_MODEL = _env("HF_TEXT_MODEL", "Qwen/Qwen2.5-7B-Instruct")
+HF_TEXT_MODEL = _env("HF_TEXT_MODEL", "openai/gpt-oss-20b")
 
 MAX_EXCERPT_LEN = int(_env("MAX_EXCERPT_LEN", "146"))
 SKIP_COMPLETE = _env("SKIP_COMPLETE", "1") not in ("0", "false", "False")

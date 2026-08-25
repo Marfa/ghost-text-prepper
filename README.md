@@ -13,7 +13,7 @@ python app.py
 | Шаг | Результат |
 | --- | --- |
 | [watermarks-remover](https://github.com/guillaumemeyer/watermarks-remover) Layer A | С тела и заголовка снимаются невидимые Unicode-пометки и `data-ai*` |
-| [Qwen/Qwen2.5-7B-Instruct](https://huggingface.co/Qwen/Qwen2.5-7B-Instruct) | `custom_excerpt`, `meta_description`, `og_description`, `twitter_description` |
+| [openai/gpt-oss-20b](https://huggingface.co/openai/gpt-oss-20b) (Inference Providers) | `custom_excerpt`, `meta_description`, `og_description`, `twitter_description` |
 
 Нужен `HF_TOKEN`. Текст поста не переписывается (Layer B / paraphrase выключен: это ломает тон). Картинки и C2PA не трогаются.
 
@@ -37,7 +37,7 @@ python app.py
 
 GitHub Actions: cron `0 6 * * *` UTC + `workflow_dispatch`.
 
-Secrets: `GHOST_ADMIN_API_KEY`, `HF_TOKEN`. Variable: `GHOST_URL` (публичный URL сайта — не секрет, иначе Job Summary маскирует ссылки).
+Secrets: `GHOST_ADMIN_API_KEY`, `HF_TOKEN`. Variables: `GHOST_URL`, `HF_TEXT_MODEL` (публичный URL сайта — не секрет, иначе Job Summary маскирует ссылки).
 
 ## Лицензия
 

@@ -1,4 +1,4 @@
 httpx>=0.28.1,<1
 PyJWT>=2.13.0,<3
 python-dotenv>=1.2.3,<2
-huggingface_hub>=1.27.0,<2
+huggingface_hub>=1.28.0,<2

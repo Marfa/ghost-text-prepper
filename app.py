@@ -2,17 +2,23 @@
 
 from __future__ import annotations
 
+import base64
+import hashlib
+import hmac
 import html
 import json
 import logging
 import os
 import re
+import secrets
 import time
 import unicodedata
+import urllib.parse
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from html.parser import HTMLParser
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
 import httpx
 import jwt
@@ -37,6 +43,11 @@ MAX_EXCERPT_LEN = int(_env("MAX_EXCERPT_LEN", "146"))
 SKIP_COMPLETE = _env("SKIP_COMPLETE", "1") not in ("0", "false", "False")
 STATE_FILE = Path(_env("STATE_FILE", "state/last-run.json"))
 TAG_STATE_FILE = Path(_env("TAG_STATE_FILE", "state/current-tag.json"))
+SOCIAL_STATE_FILE = Path(_env("SOCIAL_STATE_FILE", "state/social-last-run.json"))
+
+SocialPlatform = Literal["x", "vk", "linkedin", "pinterest"]
+SOCIAL_PLATFORMS_RU: tuple[SocialPlatform, ...] = ("x", "vk", "linkedin", "pinterest")
+SOCIAL_PLATFORMS_EN: tuple[SocialPlatform, ...] = ("x",)
 
 _MAX_ARTICLE_CHARS = 6000
 
@@ -328,21 +339,36 @@ def _ghost_token(admin_key: str) -> str:
     )
 
 
-def _ghost(method: str, path: str, **kwargs: Any) -> dict[str, Any]:
+def _ghost_headers(admin_key: str) -> dict[str, str]:
+    return {
+        "Authorization": f"Ghost {_ghost_token(admin_key)}",
+        "Accept-Version": "v5.0",
+        "Content-Type": "application/json",
+    }
+
+
+def _ghost_request(
+    method: str,
+    path: str,
+    *,
+    ghost_url: str,
+    ghost_key: str,
+    **kwargs: Any,
+) -> dict[str, Any]:
     response = http.request(
         method,
-        f"{GHOST_URL}/ghost/api/admin/{path}",
-        headers={
-            "Authorization": f"Ghost {_ghost_token(GHOST_KEY)}",
-            "Accept-Version": "v5.0",
-            "Content-Type": "application/json",
-        },
+        f"{ghost_url.rstrip('/')}/ghost/api/admin/{path}",
+        headers=_ghost_headers(ghost_key),
         **kwargs,
     )
     if response.is_error:
         log.error("ghost %s %s → %s %s", method, path, response.status_code, response.text[:500])
     response.raise_for_status()
     return response.json()
+
+
+def _ghost(method: str, path: str, **kwargs: Any) -> dict[str, Any]:
+    return _ghost_request(method, path, ghost_url=GHOST_URL, ghost_key=GHOST_KEY, **kwargs)
 
 
 def list_drafts(since: datetime) -> list[dict[str, Any]]:
@@ -513,6 +539,527 @@ def run() -> dict[str, Any]:
     }
 
 
+@dataclass(frozen=True)
+class GhostSite:
+    locale: Literal["ru", "en"]
+    ghost_url: str
+    ghost_key: str
+    platforms: tuple[SocialPlatform, ...]
+
+
+@dataclass(frozen=True)
+class SocialPost:
+    id: str
+    title: str
+    url: str
+    excerpt: str
+    feature_image: str | None
+
+
+def _social_site_configs() -> list[GhostSite]:
+    ru_url = _env("GHOST_URL_RU") or GHOST_URL
+    ru_key = _env("GHOST_ADMIN_API_KEY_RU") or GHOST_KEY
+    en_url = _env("GHOST_URL_EN")
+    en_key = _env("GHOST_ADMIN_API_KEY_EN")
+    sites: list[GhostSite] = []
+    if ru_url and ru_key:
+        sites.append(GhostSite("ru", ru_url.rstrip("/").removesuffix("/ghost"), ru_key, SOCIAL_PLATFORMS_RU))
+    if en_url and en_key:
+        sites.append(GhostSite("en", en_url.rstrip("/").removesuffix("/ghost"), en_key, SOCIAL_PLATFORMS_EN))
+    return sites
+
+
+def read_social_state() -> dict[str, Any]:
+    if not SOCIAL_STATE_FILE.exists():
+        return {"sites": {}, "delivered": {}}
+    try:
+        data = json.loads(SOCIAL_STATE_FILE.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            raise ValueError("root must be object")
+        data.setdefault("sites", {})
+        data.setdefault("delivered", {})
+        return data
+    except (json.JSONDecodeError, OSError, ValueError, TypeError):
+        log.warning("invalid social state %s — treating as first run", SOCIAL_STATE_FILE)
+        return {"sites": {}, "delivered": {}}
+
+
+def write_social_state(state: dict[str, Any]) -> None:
+    SOCIAL_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    SOCIAL_STATE_FILE.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
+
+
+def _social_last_run(state: dict[str, Any], locale: str) -> datetime | None:
+    raw = (state.get("sites") or {}).get(locale, {}).get("lastRunAt")
+    if not raw:
+        return None
+    parsed = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+def _social_delivery_key(locale: str, post_id: str) -> str:
+    return f"{locale}:{post_id}"
+
+
+def _social_delivered_platforms(state: dict[str, Any], locale: str, post_id: str) -> set[str]:
+    entry = (state.get("delivered") or {}).get(_social_delivery_key(locale, post_id), {})
+    if not isinstance(entry, dict):
+        return set()
+    return {k for k, v in entry.items() if v}
+
+
+def _record_social_delivery(
+    state: dict[str, Any],
+    locale: str,
+    post_id: str,
+    platform: SocialPlatform,
+    remote_id: str,
+) -> None:
+    key = _social_delivery_key(locale, post_id)
+    delivered = state.setdefault("delivered", {})
+    entry = delivered.setdefault(key, {})
+    if not isinstance(entry, dict):
+        entry = {}
+        delivered[key] = entry
+    entry[platform] = remote_id
+
+
+def list_published_posts(site: GhostSite, since: datetime) -> list[dict[str, Any]]:
+    since_iso = to_ghost_filter_date(since)
+    post_filter = f"status:published+published_at:>'{since_iso}'"
+    posts: list[dict[str, Any]] = []
+    page = 1
+    while True:
+        data = _ghost_request(
+            "GET",
+            "posts/",
+            ghost_url=site.ghost_url,
+            ghost_key=site.ghost_key,
+            params={
+                "filter": post_filter,
+                "order": "published_at asc",
+                "limit": 50,
+                "page": page,
+            },
+        )
+        posts.extend(data["posts"])
+        pagination = data.get("meta", {}).get("pagination", {})
+        if page >= pagination.get("pages", 1):
+            break
+        page += 1
+    return posts
+
+
+def ghost_post_to_social(post: dict[str, Any]) -> SocialPost | None:
+    url = (post.get("url") or "").strip()
+    if not url:
+        return None
+    excerpt = (
+        (post.get("custom_excerpt") or "").strip()
+        or (post.get("excerpt") or "").strip()
+        or (post.get("meta_description") or "").strip()
+        or (post.get("og_description") or "").strip()
+    )
+    feature_image = (post.get("feature_image") or "").strip() or None
+    return SocialPost(
+        id=post["id"],
+        title=(post.get("title") or "Untitled").strip(),
+        url=url,
+        excerpt=excerpt,
+        feature_image=feature_image,
+    )
+
+
+def format_social_message(item: SocialPost) -> str:
+    body = item.excerpt or item.title
+    return f"{body}\n\n{item.url}"
+
+
+def _oauth1_header(
+    method: str,
+    url: str,
+    oauth_params: dict[str, str],
+    *,
+    extra_params: dict[str, str] | None = None,
+    consumer_secret: str,
+    token_secret: str = "",
+) -> str:
+    params = {**oauth_params, **(extra_params or {})}
+    encoded = "&".join(
+        f"{urllib.parse.quote(k, safe='')}={urllib.parse.quote(v, safe='')}"
+        for k, v in sorted(params.items())
+    )
+    base = "&".join(
+        (
+            method.upper(),
+            urllib.parse.quote(url, safe=""),
+            urllib.parse.quote(encoded, safe=""),
+        )
+    )
+    signing_key = (
+        f"{urllib.parse.quote(consumer_secret, safe='')}"
+        f"&{urllib.parse.quote(token_secret, safe='')}"
+    )
+    signature = base64.b64encode(
+        hmac.new(signing_key.encode(), base.encode(), hashlib.sha1).digest()
+    ).decode()
+    oauth_params["oauth_signature"] = signature
+    header_params = ", ".join(
+        f'{k}="{urllib.parse.quote(v, safe="")}"' for k, v in sorted(oauth_params.items())
+    )
+    return f"OAuth {header_params}"
+
+
+def _x_credentials(locale: Literal["ru", "en"]) -> dict[str, str]:
+    prefix = "X_RU_" if locale == "ru" else "X_EN_"
+    return {
+        "api_key": _env(f"{prefix}API_KEY"),
+        "api_secret": _env(f"{prefix}API_SECRET"),
+        "access_token": _env(f"{prefix}ACCESS_TOKEN"),
+        "access_token_secret": _env(f"{prefix}ACCESS_TOKEN_SECRET"),
+    }
+
+
+def _download_bytes(url: str) -> bytes:
+    response = http.get(url, follow_redirects=True)
+    response.raise_for_status()
+    return response.content
+
+
+def _x_upload_media(creds: dict[str, str], image_url: str) -> str:
+    media_data = base64.b64encode(_download_bytes(image_url)).decode()
+    oauth = {
+        "oauth_consumer_key": creds["api_key"],
+        "oauth_nonce": secrets.token_hex(16),
+        "oauth_signature_method": "HMAC-SHA1",
+        "oauth_timestamp": str(int(time.time())),
+        "oauth_token": creds["access_token"],
+        "oauth_version": "1.0",
+    }
+    body = {"media_data": media_data}
+    auth = _oauth1_header(
+        "POST",
+        "https://upload.twitter.com/1.1/media/upload.json",
+        oauth,
+        extra_params=body,
+        consumer_secret=creds["api_secret"],
+        token_secret=creds["access_token_secret"],
+    )
+    response = http.post(
+        "https://upload.twitter.com/1.1/media/upload.json",
+        headers={"Authorization": auth},
+        data=body,
+    )
+    if response.is_error:
+        log.error("x media upload → %s %s", response.status_code, response.text[:500])
+    response.raise_for_status()
+    media_id = response.json().get("media_id_string")
+    if not media_id:
+        raise RuntimeError("x media upload returned no media_id_string")
+    return str(media_id)
+
+
+def post_to_x(item: SocialPost, locale: Literal["ru", "en"]) -> str:
+    creds = _x_credentials(locale)
+    missing = [k for k, v in creds.items() if not v]
+    if missing:
+        raise RuntimeError(f"Missing X credentials for {locale}: {', '.join(missing)}")
+
+    payload: dict[str, Any] = {"text": format_social_message(item)}
+    if item.feature_image:
+        payload["media"] = {"media_ids": [_x_upload_media(creds, item.feature_image)]}
+
+    oauth = {
+        "oauth_consumer_key": creds["api_key"],
+        "oauth_nonce": secrets.token_hex(16),
+        "oauth_signature_method": "HMAC-SHA1",
+        "oauth_timestamp": str(int(time.time())),
+        "oauth_token": creds["access_token"],
+        "oauth_version": "1.0",
+    }
+    auth = _oauth1_header(
+        "POST",
+        "https://api.twitter.com/2/tweets",
+        oauth,
+        consumer_secret=creds["api_secret"],
+        token_secret=creds["access_token_secret"],
+    )
+    response = http.post(
+        "https://api.twitter.com/2/tweets",
+        headers={"Authorization": auth, "Content-Type": "application/json"},
+        json=payload,
+    )
+    if response.is_error:
+        log.error("x tweet → %s %s", response.status_code, response.text[:500])
+    response.raise_for_status()
+    tweet_id = response.json().get("data", {}).get("id")
+    if not tweet_id:
+        raise RuntimeError("x tweet response missing id")
+    return str(tweet_id)
+
+
+def post_to_vk(item: SocialPost) -> str:
+    token = _env("VK_ACCESS_TOKEN")
+    owner_id = _env("VK_OWNER_ID")
+    if not token or not owner_id:
+        raise RuntimeError("Missing VK_ACCESS_TOKEN or VK_OWNER_ID")
+
+    attachments: list[str] = []
+    if item.feature_image:
+        server_resp = http.get(
+            "https://api.vk.com/method/photos.getWallUploadServer",
+            params={"access_token": token, "v": "5.199", "group_id": owner_id.lstrip("-")},
+        )
+        server_resp.raise_for_status()
+        server_payload = server_resp.json()
+        if "error" in server_payload:
+            raise RuntimeError(f"vk getWallUploadServer: {server_payload['error']}")
+        upload_url = server_payload["response"]["upload_url"]
+        image_bytes = _download_bytes(item.feature_image)
+        upload_resp = http.post(
+            upload_url,
+            files={"photo": ("feature.jpg", image_bytes, "image/jpeg")},
+        )
+        upload_resp.raise_for_status()
+        upload_data = upload_resp.json()
+        save_resp = http.get(
+            "https://api.vk.com/method/photos.saveWallPhoto",
+            params={
+                "access_token": token,
+                "v": "5.199",
+                "group_id": owner_id.lstrip("-"),
+                "server": upload_data["server"],
+                "photo": upload_data["photo"],
+                "hash": upload_data["hash"],
+            },
+        )
+        save_resp.raise_for_status()
+        save_payload = save_resp.json()
+        if "error" in save_payload:
+            raise RuntimeError(f"vk saveWallPhoto: {save_payload['error']}")
+        photo = save_payload["response"][0]
+        attachments.append(f"photo{photo['owner_id']}_{photo['id']}")
+
+    wall_params: dict[str, Any] = {
+        "access_token": token,
+        "v": "5.199",
+        "owner_id": owner_id,
+        "from_group": 1,
+        "message": format_social_message(item),
+    }
+    if attachments:
+        wall_params["attachments"] = ",".join(attachments)
+    wall_resp = http.get("https://api.vk.com/method/wall.post", params=wall_params)
+    wall_resp.raise_for_status()
+    wall_payload = wall_resp.json()
+    if "error" in wall_payload:
+        raise RuntimeError(f"vk wall.post: {wall_payload['error']}")
+    post_id = wall_payload["response"]["post_id"]
+    return f"{owner_id}_{post_id}"
+
+
+def post_to_linkedin(item: SocialPost) -> str:
+    token = _env("LINKEDIN_ACCESS_TOKEN")
+    author = _env("LINKEDIN_AUTHOR_URN")
+    if not token or not author:
+        raise RuntimeError("Missing LINKEDIN_ACCESS_TOKEN or LINKEDIN_AUTHOR_URN")
+
+    payload = {
+        "author": author,
+        "commentary": format_social_message(item),
+        "visibility": "PUBLIC",
+        "distribution": {"feedDistribution": "MAIN_FEED"},
+        "content": {
+            "article": {
+                "source": item.url,
+                "title": item.title,
+                "description": item.excerpt or item.title,
+            }
+        },
+        "lifecycleState": "PUBLISHED",
+    }
+
+    response = http.post(
+        "https://api.linkedin.com/rest/posts",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+            "LinkedIn-Version": "202405",
+            "X-Restli-Protocol-Version": "2.0.0",
+        },
+        json=payload,
+    )
+    if response.is_error:
+        log.error("linkedin post → %s %s", response.status_code, response.text[:500])
+    response.raise_for_status()
+    post_id = response.headers.get("x-restli-id") or response.headers.get("X-RestLi-Id")
+    if not post_id:
+        raise RuntimeError("linkedin post response missing x-restli-id")
+    return str(post_id)
+
+
+def post_to_pinterest(item: SocialPost) -> str:
+    token = _env("PINTEREST_ACCESS_TOKEN")
+    board_id = _env("PINTEREST_BOARD_ID")
+    if not token or not board_id:
+        raise RuntimeError("Missing PINTEREST_ACCESS_TOKEN or PINTEREST_BOARD_ID")
+    if not item.feature_image:
+        raise RuntimeError("pinterest requires feature_image")
+
+    payload = {
+        "board_id": board_id,
+        "title": item.title[:100],
+        "description": (item.excerpt or item.title)[:500],
+        "link": item.url,
+        "media_source": {
+            "source_type": "image_url",
+            "url": item.feature_image,
+        },
+    }
+    response = http.post(
+        "https://api.pinterest.com/v5/pins",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+        },
+        json=payload,
+    )
+    if response.is_error:
+        log.error("pinterest pin → %s %s", response.status_code, response.text[:500])
+    response.raise_for_status()
+    pin_id = response.json().get("id")
+    if not pin_id:
+        raise RuntimeError("pinterest pin response missing id")
+    return str(pin_id)
+
+
+def _dispatch_social_post(
+    platform: SocialPlatform,
+    item: SocialPost,
+    locale: Literal["ru", "en"],
+) -> str:
+    if platform == "x":
+        return post_to_x(item, locale)
+    if platform == "vk":
+        return post_to_vk(item)
+    if platform == "linkedin":
+        return post_to_linkedin(item)
+    if platform == "pinterest":
+        return post_to_pinterest(item)
+    raise RuntimeError(f"unknown platform {platform!r}")
+
+
+def format_social_summary(summary: dict[str, Any]) -> str:
+    lines = ["## Social cross-post", ""]
+    if summary.get("first_run"):
+        lines.append("First run — baseline saved, no posts published.")
+        return "\n".join(lines)
+    lines.append(
+        f"Published posts checked: **{summary['posts']}** · "
+        f"delivered: **{summary['delivered']}** · "
+        f"errors: **{summary['errors']}**"
+    )
+    for row in summary.get("results", []):
+        if row.get("error"):
+            lines.append(f"- `{row.get('locale')}:{row.get('id')}` / {row.get('platform')}: {row['error']}")
+        elif row.get("delivered"):
+            lines.append(
+                f"- `{row.get('locale')}:{row.get('id')}` → {row.get('platform')} "
+                f"({row.get('remote_id')})"
+            )
+    return "\n".join(lines)
+
+
+def run_social() -> dict[str, Any]:
+    sites = _social_site_configs()
+    if not sites:
+        raise RuntimeError("No Ghost sites configured for social (GHOST_URL_RU/EN + keys)")
+
+    run_started_at = datetime.now(timezone.utc)
+    state = read_social_state()
+    results: list[dict[str, Any]] = []
+    errors = 0
+    delivered_count = 0
+    posts_checked = 0
+    first_run = all(_social_last_run(state, site.locale) is None for site in sites)
+
+    if first_run:
+        for site in sites:
+            state.setdefault("sites", {}).setdefault(site.locale, {})["lastRunAt"] = to_ghost_filter_date(
+                run_started_at
+            )
+        write_social_state(state)
+        return {
+            "first_run": True,
+            "posts": 0,
+            "delivered": 0,
+            "errors": 0,
+            "results": [],
+        }
+
+    for site in sites:
+        since = _social_last_run(state, site.locale)
+        if since is None:
+            continue
+        log.info("[%s] collecting published posts after %s", site.locale, to_ghost_filter_date(since))
+        raw_posts = list_published_posts(site, since)
+        log.info("[%s] found %s published post(s)", site.locale, len(raw_posts))
+        for raw in raw_posts:
+            item = ghost_post_to_social(raw)
+            if item is None:
+                log.warning("[%s] skip post %s — no public url", site.locale, raw.get("id"))
+                continue
+            posts_checked += 1
+            done = _social_delivered_platforms(state, site.locale, item.id)
+            for platform in site.platforms:
+                if platform in done:
+                    continue
+                try:
+                    remote_id = _dispatch_social_post(platform, item, site.locale)
+                    _record_social_delivery(state, site.locale, item.id, platform, remote_id)
+                    delivered_count += 1
+                    row = {
+                        "locale": site.locale,
+                        "id": item.id,
+                        "title": item.title,
+                        "platform": platform,
+                        "delivered": True,
+                        "remote_id": remote_id,
+                    }
+                    results.append(row)
+                    log.info("[%s] %s → %s (%s)", site.locale, item.id, platform, remote_id)
+                except Exception as exc:
+                    errors += 1
+                    log.exception("[%s] %s / %s failed", site.locale, item.id, platform)
+                    results.append(
+                        {
+                            "locale": site.locale,
+                            "id": item.id,
+                            "title": item.title,
+                            "platform": platform,
+                            "error": str(exc),
+                        }
+                    )
+                time.sleep(1)
+
+    if errors:
+        log.warning("not updating social last-run — %s error(s), will retry next run", errors)
+    else:
+        for site in sites:
+            state.setdefault("sites", {}).setdefault(site.locale, {})["lastRunAt"] = to_ghost_filter_date(
+                run_started_at
+            )
+
+    write_social_state(state)
+    return {
+        "first_run": False,
+        "posts": posts_checked,
+        "delivered": delivered_count,
+        "errors": errors,
+        "results": results,
+    }
+
+
 def _self_check() -> None:
     assert truncate_excerpt("a" * 10, 146) == "a" * 10
     assert len(truncate_excerpt("word " * 50, 146)) <= 146
@@ -544,6 +1091,34 @@ def _self_check() -> None:
     assert 'href="https://example.com/ghost/#/posts?tag=x"' in link
     assert 'target="_blank"' in link
     assert "rel=" in link and "noopener" in link
+    sample = SocialPost(
+        id="1",
+        title="Title",
+        url="https://example.com/post",
+        excerpt="Short excerpt",
+        feature_image="https://example.com/img.jpg",
+    )
+    assert "Short excerpt" in format_social_message(sample)
+    assert "https://example.com/post" in format_social_message(sample)
+    assert SOCIAL_PLATFORMS_EN == ("x",)
+    assert len(SOCIAL_PLATFORMS_RU) == 4
+    oauth = {
+        "oauth_consumer_key": "key",
+        "oauth_nonce": "nonce",
+        "oauth_signature_method": "HMAC-SHA1",
+        "oauth_timestamp": "123",
+        "oauth_token": "token",
+        "oauth_version": "1.0",
+    }
+    header = _oauth1_header(
+        "POST",
+        "https://api.twitter.com/2/tweets",
+        dict(oauth),
+        consumer_secret="secret",
+        token_secret="token_secret",
+    )
+    assert header.startswith("OAuth ")
+    assert "oauth_signature=" in header
     log.info("self-check ok")
 
 
@@ -564,6 +1139,11 @@ if __name__ == "__main__":
         action="store_true",
         help="with --set-current-tag, update state without advancing to the next tag",
     )
+    parser.add_argument(
+        "--social",
+        action="store_true",
+        help="cross-post newly published Ghost posts to social networks",
+    )
     args = parser.parse_args()
 
     if args.self_check:
@@ -581,6 +1161,18 @@ if __name__ == "__main__":
         summary_path = os.getenv("GITHUB_STEP_SUMMARY")
         if summary_path:
             Path(summary_path).write_text(summary_md + "\n", encoding="utf-8")
+        sys.exit(0)
+
+    if args.social:
+        _self_check()
+        summary = run_social()
+        summary_md = format_social_summary(summary)
+        log.info("%s", summary_md.replace("## ", "").replace("**", ""))
+        summary_path = os.getenv("GITHUB_STEP_SUMMARY")
+        if summary_path:
+            Path(summary_path).write_text(summary_md + "\n", encoding="utf-8")
+        if summary.get("errors"):
+            sys.exit(1)
         sys.exit(0)
 
     _self_check()

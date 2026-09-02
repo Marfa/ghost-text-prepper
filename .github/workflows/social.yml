@@ -1,0 +1,53 @@
+name: Social cross-post
+
+on:
+  # Schedule disabled until social API secrets are configured.
+  # - cron: "0 */6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  social:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      - run: python app.py --self-check
+
+      - name: Cross-post published articles
+        env:
+          GHOST_URL: ${{ vars.GHOST_URL }}
+          GHOST_ADMIN_API_KEY: ${{ secrets.GHOST_ADMIN_API_KEY }}
+          GHOST_URL_RU: ${{ vars.GHOST_URL_RU }}
+          GHOST_ADMIN_API_KEY_RU: ${{ secrets.GHOST_ADMIN_API_KEY_RU }}
+          GHOST_URL_EN: ${{ vars.GHOST_URL_EN }}
+          GHOST_ADMIN_API_KEY_EN: ${{ secrets.GHOST_ADMIN_API_KEY_EN }}
+          X_RU_API_KEY: ${{ secrets.X_RU_API_KEY }}
+          X_RU_API_SECRET: ${{ secrets.X_RU_API_SECRET }}
+          X_RU_ACCESS_TOKEN: ${{ secrets.X_RU_ACCESS_TOKEN }}
+          X_RU_ACCESS_TOKEN_SECRET: ${{ secrets.X_RU_ACCESS_TOKEN_SECRET }}
+          X_EN_API_KEY: ${{ secrets.X_EN_API_KEY }}
+          X_EN_API_SECRET: ${{ secrets.X_EN_API_SECRET }}
+          X_EN_ACCESS_TOKEN: ${{ secrets.X_EN_ACCESS_TOKEN }}
+          X_EN_ACCESS_TOKEN_SECRET: ${{ secrets.X_EN_ACCESS_TOKEN_SECRET }}
+          VK_ACCESS_TOKEN: ${{ secrets.VK_ACCESS_TOKEN }}
+          VK_OWNER_ID: ${{ vars.VK_OWNER_ID }}
+          LINKEDIN_ACCESS_TOKEN: ${{ secrets.LINKEDIN_ACCESS_TOKEN }}
+          LINKEDIN_AUTHOR_URN: ${{ vars.LINKEDIN_AUTHOR_URN }}
+          PINTEREST_ACCESS_TOKEN: ${{ secrets.PINTEREST_ACCESS_TOKEN }}
+          PINTEREST_BOARD_ID: ${{ vars.PINTEREST_BOARD_ID }}
+        run: python app.py --social
+
+      - uses: stefanzweifel/git-auto-commit-action@v7
+        with:
+          commit_message: "chore: update social cross-post state"
+          file_pattern: state/social-last-run.json

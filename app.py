@@ -424,28 +424,57 @@ def _excerpt_via_hf(messages: list[dict[str, str]]) -> str:
     return truncate_excerpt(text)
 
 
+def _groq_retry_wait(response: httpx.Response) -> float:
+    """Parse Groq 429 'try again in Xs/ms'; fallback 2s."""
+    retry_after = response.headers.get("retry-after")
+    if retry_after:
+        try:
+            return max(float(retry_after), 0.5)
+        except ValueError:
+            pass
+    match = re.search(r"try again in ([\d.]+)\s*(ms|s)", response.text or "", re.I)
+    if match:
+        value = float(match.group(1))
+        return max(value / 1000.0 if match.group(2).lower() == "ms" else value, 0.5)
+    return 2.0
+
+
 def _excerpt_via_groq(messages: list[dict[str, str]]) -> str:
     if not GROQ_API_KEY:
         raise RuntimeError("Missing GROQ_API_KEY")
-    response = http.post(
-        "https://api.groq.com/openai/v1/chat/completions",
-        headers={
-            "Authorization": f"Bearer {GROQ_API_KEY}",
-            "Content-Type": "application/json",
-        },
-        json={
-            "model": GROQ_TEXT_MODEL,
-            "messages": messages,
-            "max_tokens": 120,
-            "temperature": 0.3,
-        },
-    )
-    if response.is_error:
-        log.error("groq chat → %s %s", response.status_code, response.text[:500])
-    response.raise_for_status()
-    data = response.json()
-    text = (data["choices"][0]["message"]["content"] or "").strip()
-    return truncate_excerpt(text)
+    # ponytail: free tier ~30 RPM / 8k TPM; retry 429 instead of failing the post.
+    last_error: Exception | None = None
+    for attempt in range(8):
+        response = http.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {GROQ_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": GROQ_TEXT_MODEL,
+                "messages": messages,
+                "max_tokens": 120,
+                "temperature": 0.3,
+            },
+        )
+        if response.status_code == 429:
+            wait = _groq_retry_wait(response)
+            log.warning("groq 429 — sleep %.1fs (attempt %s/8)", wait, attempt + 1)
+            time.sleep(wait)
+            last_error = httpx.HTTPStatusError(
+                f"429 Too Many Requests after {attempt + 1} retries",
+                request=response.request,
+                response=response,
+            )
+            continue
+        if response.is_error:
+            log.error("groq chat → %s %s", response.status_code, response.text[:500])
+        response.raise_for_status()
+        data = response.json()
+        text = (data["choices"][0]["message"]["content"] or "").strip()
+        return truncate_excerpt(text)
+    raise last_error or RuntimeError("groq rate limit retries exhausted")
 
 
 def generate_excerpt(title: str, body: str) -> str:
@@ -570,7 +599,8 @@ def run() -> dict[str, Any]:
             log.exception("post %s failed", post.get("id"))
             results.append({"id": post.get("id"), "title": post.get("title"), "error": str(exc)})
         if i + 1 < len(drafts):
-            time.sleep(1)
+            # Free Groq is ~30 RPM; 2.5s when on HF-skip/Groq path stays under the limit.
+            time.sleep(2.5 if _hf_skip_run else 1)
 
     errors = sum(1 for r in results if r.get("error"))
     if errors:
@@ -622,6 +652,10 @@ def _self_check() -> None:
     assert "rel=" in link and "noopener" in link
     assert _is_hf_credits_error(RuntimeError("402 Payment Required"))
     assert not _is_hf_credits_error(RuntimeError("timeout"))
+    fake_429 = httpx.Response(429, text='{"error":{"message":"Please try again in 1.5s"}}')
+    assert abs(_groq_retry_wait(fake_429) - 1.5) < 0.01
+    fake_ms = httpx.Response(429, text="Please try again in 500ms")
+    assert abs(_groq_retry_wait(fake_ms) - 0.5) < 0.01
     log.info("self-check ok")
 
 

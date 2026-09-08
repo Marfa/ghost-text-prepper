@@ -33,7 +33,7 @@ GHOST_KEY = _env("GHOST_ADMIN_API_KEY")
 HF_TOKEN = _env("HF_TOKEN")
 HF_TEXT_MODEL = _env("HF_TEXT_MODEL", "openai/gpt-oss-20b")
 GROQ_API_KEY = _env("GROQ_API_KEY")
-GROQ_TEXT_MODEL = _env("GROQ_TEXT_MODEL", "llama-3.1-8b-instant")
+GROQ_TEXT_MODEL = _env("GROQ_TEXT_MODEL", "openai/gpt-oss-20b")
 
 MAX_EXCERPT_LEN = int(_env("MAX_EXCERPT_LEN", "146"))
 SKIP_COMPLETE = _env("SKIP_COMPLETE", "1") not in ("0", "false", "False")

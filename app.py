@@ -32,6 +32,8 @@ GHOST_URL = _env("GHOST_URL").rstrip("/").removesuffix("/ghost")
 GHOST_KEY = _env("GHOST_ADMIN_API_KEY")
 HF_TOKEN = _env("HF_TOKEN")
 HF_TEXT_MODEL = _env("HF_TEXT_MODEL", "openai/gpt-oss-20b")
+GROQ_API_KEY = _env("GROQ_API_KEY")
+GROQ_TEXT_MODEL = _env("GROQ_TEXT_MODEL", "llama-3.1-8b-instant")
 
 MAX_EXCERPT_LEN = int(_env("MAX_EXCERPT_LEN", "146"))
 SKIP_COMPLETE = _env("SKIP_COMPLETE", "1") not in ("0", "false", "False")
@@ -41,6 +43,9 @@ TAG_STATE_FILE = Path(_env("TAG_STATE_FILE", "state/current-tag.json"))
 _MAX_ARTICLE_CHARS = 6000
 
 http = httpx.Client(timeout=httpx.Timeout(30.0, read=180.0))
+
+# ponytail: skip HF for the rest of the run after 402 credits; reset in run().
+_hf_skip_run = False
 
 
 def to_ghost_filter_date(when: datetime) -> str:
@@ -386,7 +391,7 @@ def _hf_client() -> InferenceClient:
     return InferenceClient(api_key=HF_TOKEN)
 
 
-def generate_excerpt(title: str, body: str) -> str:
+def _excerpt_messages(title: str, body: str) -> list[dict[str, str]]:
     system = (
         "You write short SEO / social meta descriptions for blog posts. "
         f"Reply with ONE plain sentence in the same language as the article. "
@@ -394,18 +399,85 @@ def generate_excerpt(title: str, body: str) -> str:
         "No quotes, no hashtags, no emoji, no title prefix."
     )
     user = f"Title: {title}\n\nArticle:\n{body[:_MAX_ARTICLE_CHARS]}"
-    client = _hf_client()
-    completion = client.chat.completions.create(
+    return [
+        {"role": "system", "content": system},
+        {"role": "user", "content": user},
+    ]
+
+
+def _is_hf_credits_error(exc: BaseException) -> bool:
+    status = getattr(getattr(exc, "response", None), "status_code", None)
+    if status == 402:
+        return True
+    msg = str(exc).lower()
+    return "402" in msg or "payment required" in msg or "depleted your monthly" in msg
+
+
+def _excerpt_via_hf(messages: list[dict[str, str]]) -> str:
+    completion = _hf_client().chat.completions.create(
         model=HF_TEXT_MODEL,
-        messages=[
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ],
+        messages=messages,
         max_tokens=120,
         temperature=0.3,
     )
     text = (completion.choices[0].message.content or "").strip()
     return truncate_excerpt(text)
+
+
+def _excerpt_via_groq(messages: list[dict[str, str]]) -> str:
+    if not GROQ_API_KEY:
+        raise RuntimeError("Missing GROQ_API_KEY")
+    response = http.post(
+        "https://api.groq.com/openai/v1/chat/completions",
+        headers={
+            "Authorization": f"Bearer {GROQ_API_KEY}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "model": GROQ_TEXT_MODEL,
+            "messages": messages,
+            "max_tokens": 120,
+            "temperature": 0.3,
+        },
+    )
+    if response.is_error:
+        log.error("groq chat → %s %s", response.status_code, response.text[:500])
+    response.raise_for_status()
+    data = response.json()
+    text = (data["choices"][0]["message"]["content"] or "").strip()
+    return truncate_excerpt(text)
+
+
+def generate_excerpt(title: str, body: str) -> str:
+    """HF first; on failure (esp. 402 credits) fall back to Groq if configured."""
+    global _hf_skip_run
+    messages = _excerpt_messages(title, body)
+    errors: list[BaseException] = []
+
+    if HF_TOKEN and not _hf_skip_run:
+        try:
+            return _excerpt_via_hf(messages)
+        except Exception as exc:
+            if _is_hf_credits_error(exc):
+                _hf_skip_run = True
+                log.warning("HF credits exhausted — using Groq for the rest of this run")
+            else:
+                log.warning("HF excerpt failed: %s", exc)
+            errors.append(exc)
+
+    if GROQ_API_KEY:
+        try:
+            text = _excerpt_via_groq(messages)
+            if errors:
+                log.info("excerpt via Groq fallback (%s)", GROQ_TEXT_MODEL)
+            return text
+        except Exception as exc:
+            errors.append(exc)
+            raise RuntimeError(f"excerpt failed after HF then Groq: {errors}") from exc
+
+    if errors:
+        raise errors[-1]
+    raise RuntimeError("Missing HF_TOKEN or GROQ_API_KEY")
 
 
 def process_post(post: dict[str, Any]) -> dict[str, Any]:
@@ -457,13 +529,17 @@ def process_post(post: dict[str, Any]) -> dict[str, Any]:
 
 
 def run() -> dict[str, Any]:
+    global _hf_skip_run
+    _hf_skip_run = False
+
     for name, value in {
         "GHOST_URL": GHOST_URL,
         "GHOST_ADMIN_API_KEY": GHOST_KEY,
-        "HF_TOKEN": HF_TOKEN,
     }.items():
         if not value:
             raise RuntimeError(f"Missing {name}")
+    if not HF_TOKEN and not GROQ_API_KEY:
+        raise RuntimeError("Missing HF_TOKEN or GROQ_API_KEY")
 
     run_started_at = datetime.now(timezone.utc)
     last_run_at = read_last_run()
@@ -544,6 +620,8 @@ def _self_check() -> None:
     assert 'href="https://example.com/ghost/#/posts?tag=x"' in link
     assert 'target="_blank"' in link
     assert "rel=" in link and "noopener" in link
+    assert _is_hf_credits_error(RuntimeError("402 Payment Required"))
+    assert not _is_hf_credits_error(RuntimeError("timeout"))
     log.info("self-check ok")
 
 

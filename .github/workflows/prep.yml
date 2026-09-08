@@ -30,6 +30,8 @@ jobs:
           GHOST_ADMIN_API_KEY: ${{ secrets.GHOST_ADMIN_API_KEY }}
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           HF_TEXT_MODEL: ${{ vars.HF_TEXT_MODEL }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          GROQ_TEXT_MODEL: ${{ vars.GROQ_TEXT_MODEL }}
           MAX_EXCERPT_LEN: "146"
           SKIP_COMPLETE: "1"
         run: python app.py

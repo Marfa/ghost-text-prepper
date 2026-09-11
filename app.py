@@ -37,8 +37,12 @@ GROQ_TEXT_MODEL = _env("GROQ_TEXT_MODEL", "openai/gpt-oss-20b")
 
 MAX_EXCERPT_LEN = int(_env("MAX_EXCERPT_LEN", "146"))
 SKIP_COMPLETE = _env("SKIP_COMPLETE", "1") not in ("0", "false", "False")
+# Telegram WebpageBot rejects JPEG bytes under a .png URL; re-upload real .jpg for og/twitter.
+FIX_TELEGRAM_OG = _env("FIX_TELEGRAM_OG", "1") not in ("0", "false", "False")
 STATE_FILE = Path(_env("STATE_FILE", "state/last-run.json"))
 TAG_STATE_FILE = Path(_env("TAG_STATE_FILE", "state/current-tag.json"))
+_PNG_URL_RE = re.compile(r"\.png(?:\?|$)", re.I)
+_JPEG_URL_RE = re.compile(r"\.jpe?g(?:\?|$)", re.I)
 
 _MAX_ARTICLE_CHARS = 6000
 
@@ -430,6 +434,166 @@ def update_post(post_id: str, updated_at: str, fields: dict[str, Any]) -> dict[s
     return _ghost("PUT", f"posts/{post_id}/", **kwargs)["posts"][0]
 
 
+def is_png_url(url: str | None) -> bool:
+    return bool(url and _PNG_URL_RE.search(url))
+
+
+def is_jpeg_url(url: str | None) -> bool:
+    return bool(url and _JPEG_URL_RE.search(url) and not is_png_url(url))
+
+
+def to_jpeg_transform_url(image_url: str) -> str:
+    """Ghost CDN keeps the original extension; /format/jpeg/ still serves image/jpeg bytes."""
+    if "/content/images/" not in image_url:
+        return image_url
+    if "/format/jpeg/" in image_url:
+        return image_url
+    return image_url.replace("/content/images/", "/content/images/size/w1200/format/jpeg/", 1)
+
+
+def needs_telegram_og_fix(post: dict[str, Any], *, enabled: bool | None = None) -> bool:
+    if enabled is None:
+        enabled = FIX_TELEGRAM_OG
+    if not enabled:
+        return False
+    og = post.get("og_image") or ""
+    if is_jpeg_url(og):
+        return False
+    source = og or (post.get("feature_image") or "")
+    return is_png_url(source)
+
+
+def upload_jpeg_image(jpeg_bytes: bytes, filename: str) -> str:
+    """Upload JPEG via Admin API; filename must end with .jpg so Ghost stores a .jpg URL."""
+    response = http.post(
+        f"{GHOST_URL}/ghost/api/admin/images/upload/",
+        headers={
+            "Authorization": f"Ghost {_ghost_token(GHOST_KEY)}",
+            "Accept-Version": "v5.0",
+        },
+        files={"file": (filename, jpeg_bytes, "image/jpeg")},
+        data={"purpose": "image"},
+    )
+    if response.is_error:
+        log.error("ghost image upload → %s %s", response.status_code, response.text[:500])
+    response.raise_for_status()
+    url = (response.json().get("images") or [{}])[0].get("url") or ""
+    if not is_jpeg_url(url):
+        raise RuntimeError(f"upload did not return .jpg URL: {url!r}")
+    return url
+
+
+def build_telegram_og_fields(post: dict[str, Any], *, enabled: bool | None = None) -> dict[str, Any]:
+    """Download Ghost JPEG transform of PNG cover, re-upload as .jpg, return og/twitter fields."""
+    if not needs_telegram_og_fix(post, enabled=enabled):
+        return {}
+    source = (post.get("og_image") or post.get("feature_image") or "").strip()
+    if not source:
+        return {}
+    transform = to_jpeg_transform_url(source)
+    response = http.get(transform, headers={"User-Agent": "TelegramBot (like TwitterBot)"})
+    response.raise_for_status()
+    jpeg_bytes = response.content
+    if len(jpeg_bytes) < 100 or jpeg_bytes[:2] != b"\xff\xd8":
+        raise RuntimeError(f"transform is not JPEG for {post.get('slug')}: {transform}")
+    slug = (post.get("slug") or post.get("id") or "post").strip() or "post"
+    uploaded = upload_jpeg_image(jpeg_bytes, f"{slug}-og.jpg")
+    log.info("telegram og %s → %s", slug, uploaded)
+    return {"og_image": uploaded, "twitter_image": uploaded}
+
+
+def list_posts(post_filter: str) -> list[dict[str, Any]]:
+    posts: list[dict[str, Any]] = []
+    page = 1
+    while True:
+        data = _ghost(
+            "GET",
+            "posts/",
+            params={
+                "filter": post_filter,
+                "order": "updated_at asc",
+                "limit": 50,
+                "page": page,
+            },
+        )
+        posts.extend(data["posts"])
+        pagination = data.get("meta", {}).get("pagination", {})
+        if page >= pagination.get("pages", 1):
+            break
+        page += 1
+    return posts
+
+
+def fix_telegram_og_on_posts(
+    posts: list[dict[str, Any]],
+    *,
+    enabled: bool | None = None,
+) -> list[dict[str, Any]]:
+    results: list[dict[str, Any]] = []
+    for post in posts:
+        if not needs_telegram_og_fix(post, enabled=enabled):
+            continue
+        try:
+            fields = build_telegram_og_fields(post, enabled=enabled)
+            if not fields:
+                continue
+            saved = update_post(post["id"], post["updated_at"], fields)
+            results.append(
+                {
+                    "id": post["id"],
+                    "title": post.get("title"),
+                    "slug": saved.get("slug") or post.get("slug"),
+                    "updated": True,
+                    "telegram_og": True,
+                    "og_image": fields["og_image"],
+                }
+            )
+        except Exception as exc:
+            log.exception("telegram og failed for %s", post.get("id"))
+            results.append(
+                {
+                    "id": post.get("id"),
+                    "title": post.get("title"),
+                    "slug": post.get("slug"),
+                    "error": str(exc),
+                    "telegram_og": True,
+                }
+            )
+    return results
+
+
+def run_telegram_og_fix(
+    *,
+    all_png: bool = False,
+    since: datetime | None = None,
+    force: bool = False,
+) -> dict[str, Any]:
+    """Re-upload PNG covers as .jpg og_image for drafts/published posts."""
+    for name, value in {"GHOST_URL": GHOST_URL, "GHOST_ADMIN_API_KEY": GHOST_KEY}.items():
+        if not value:
+            raise RuntimeError(f"Missing {name}")
+    enabled = True if force else FIX_TELEGRAM_OG
+    if not enabled:
+        log.info("telegram og skipped (FIX_TELEGRAM_OG=0)")
+        return {"candidates": 0, "updated": 0, "errors": 0, "results": []}
+    if all_png:
+        posts = list_posts("status:[draft,published]")
+    else:
+        if since is None:
+            raise RuntimeError("since required unless all_png")
+        since_iso = to_ghost_filter_date(since)
+        posts = list_posts(f"status:published+updated_at:>'{since_iso}'")
+    targets = [p for p in posts if needs_telegram_og_fix(p, enabled=True)]
+    log.info("telegram og candidates: %s", len(targets))
+    results = fix_telegram_og_on_posts(targets, enabled=True)
+    return {
+        "candidates": len(targets),
+        "updated": sum(1 for r in results if r.get("updated")),
+        "errors": sum(1 for r in results if r.get("error")),
+        "results": results,
+    }
+
+
 def _hf_client() -> InferenceClient:
     if not HF_TOKEN:
         raise RuntimeError("Missing HF_TOKEN")
@@ -565,10 +729,11 @@ def process_post(post: dict[str, Any]) -> dict[str, Any]:
     marks_removed = html_marks + title_marks
     body = html_to_text(html_clean)
     excerpt_needed = needs_excerpt(post)
+    telegram_og_needed = needs_telegram_og_fix(post)
 
-    if len(body) < 40 and not marks_removed:
+    if len(body) < 40 and not marks_removed and not telegram_og_needed:
         return {"id": post_id, "title": title, "skipped": True, "reason": "body too short"}
-    if not excerpt_needed and not marks_removed:
+    if not excerpt_needed and not marks_removed and not telegram_og_needed:
         return {"id": post_id, "title": title, "skipped": True, "reason": "already complete"}
 
     fields: dict[str, Any] = {}
@@ -587,6 +752,8 @@ def process_post(post: dict[str, Any]) -> dict[str, Any]:
         fields["html"] = html_clean
     if title_clean != title:
         fields["title"] = title_clean
+    if telegram_og_needed:
+        fields.update(build_telegram_og_fields(post))
     if not fields:
         return {"id": post_id, "title": title, "skipped": True, "reason": "already complete"}
 
@@ -601,6 +768,9 @@ def process_post(post: dict[str, Any]) -> dict[str, Any]:
         result["excerpt"] = excerpt
     if marks_removed:
         result["marks_removed"] = marks_removed
+    if fields.get("og_image"):
+        result["telegram_og"] = True
+        result["og_image"] = fields["og_image"]
     return result
 
 
@@ -649,6 +819,17 @@ def run() -> dict[str, Any]:
             # Free Groq is ~30 RPM; 2.5s when on HF-skip/Groq path stays under the limit.
             time.sleep(2.5 if _hf_skip_run else 1)
 
+    if FIX_TELEGRAM_OG:
+        # Published posts updated in the same window (covers set after draft prep).
+        pub = run_telegram_og_fix(since=last_run_at)
+        results.extend(pub["results"])
+        log.info(
+            "telegram og published window: candidates=%s updated=%s errors=%s",
+            pub["candidates"],
+            pub["updated"],
+            pub["errors"],
+        )
+
     errors = sum(1 for r in results if r.get("error"))
     if errors:
         log.warning("not updating last-run — %s error(s), will retry same window next run", errors)
@@ -662,6 +843,7 @@ def run() -> dict[str, Any]:
         "updated": sum(1 for r in results if r.get("updated")),
         "skipped": sum(1 for r in results if r.get("skipped")),
         "errors": errors,
+        "telegram_og": sum(1 for r in results if r.get("telegram_og") and r.get("updated")),
         "results": results,
     }
 
@@ -711,6 +893,15 @@ def _self_check() -> None:
     assert abs(_groq_retry_wait(fake_429) - 1.5) < 0.01
     fake_ms = httpx.Response(429, text="Please try again in 500ms")
     assert abs(_groq_retry_wait(fake_ms) - 0.5) < 0.01
+    assert is_png_url("https://cdn.example/content/images/a.png")
+    assert not is_png_url("https://cdn.example/content/images/a.jpg")
+    assert is_jpeg_url("https://cdn.example/x-og.jpg")
+    assert not is_jpeg_url("https://cdn.example/x.png")
+    transformed = to_jpeg_transform_url(
+        "https://storage.ghost.io/c/x/content/images/2026/09/cover.png"
+    )
+    assert "/size/w1200/format/jpeg/" in transformed
+    assert transformed.endswith("cover.png")
     log.info("self-check ok")
 
 
@@ -720,6 +911,11 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="Ghost draft prep and tag rotation")
     parser.add_argument("--self-check", action="store_true", help="run helper self-check only")
+    parser.add_argument(
+        "--fix-telegram-og",
+        action="store_true",
+        help="re-upload PNG covers as real .jpg og_image/twitter_image (all drafts+published)",
+    )
     parser.add_argument("--tag-rotate", action="store_true", help="suggest next Ghost tag")
     parser.add_argument(
         "--set-current-tag",
@@ -736,6 +932,17 @@ if __name__ == "__main__":
     if args.self_check:
         _self_check()
         sys.exit(0)
+
+    if args.fix_telegram_og:
+        _self_check()
+        summary = run_telegram_og_fix(all_png=True, force=True)
+        log.info(
+            "telegram og done: candidates=%s updated=%s errors=%s",
+            summary["candidates"],
+            summary["updated"],
+            summary["errors"],
+        )
+        sys.exit(1 if summary["errors"] else 0)
 
     if args.tag_rotate or args.set_current_tag:
         _self_check()

@@ -34,6 +34,7 @@ jobs:
           GROQ_TEXT_MODEL: ${{ vars.GROQ_TEXT_MODEL }}
           MAX_EXCERPT_LEN: "146"
           SKIP_COMPLETE: "1"
+          FIX_TELEGRAM_OG: "1"
         run: python app.py
 
       - uses: stefanzweifel/git-auto-commit-action@v7

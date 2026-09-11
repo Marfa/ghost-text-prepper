@@ -15,10 +15,15 @@ on:
 
 permissions:
   contents: write
+  deployments: write
 
 jobs:
   next-tag:
     runs-on: ubuntu-latest
+    # Actions UI "View deployment" uses target=_blank; Job Summary strips it from HTML.
+    environment:
+      name: ghost-suggested-tag
+      url: ${{ steps.suggest.outputs.posts_url }}
     steps:
       - uses: actions/checkout@v7
 
@@ -30,6 +35,7 @@ jobs:
       - run: pip install -r requirements.txt
 
       - name: Suggest next tag
+        id: suggest
         env:
           # Public site URL must be a variable — secrets are masked in Job Summary and break links.
           GHOST_URL: ${{ vars.GHOST_URL }}

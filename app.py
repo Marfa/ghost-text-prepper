@@ -104,6 +104,14 @@ def html_blank_link(url: str, label: str) -> str:
     )
 
 
+def tag_post_count(tag: dict[str, Any]) -> int:
+    raw = (tag.get("count") or {}).get("posts")
+    try:
+        return int(raw or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
 def list_tags() -> list[dict[str, Any]]:
     tags: list[dict[str, Any]] = []
     page = 1
@@ -111,7 +119,12 @@ def list_tags() -> list[dict[str, Any]]:
         data = _ghost(
             "GET",
             "tags/",
-            params={"order": "name asc", "limit": 100, "page": page},
+            params={
+                "order": "name asc",
+                "limit": 100,
+                "page": page,
+                "include": "count.posts",
+            },
         )
         tags.extend(data["tags"])
         pagination = data.get("meta", {}).get("pagination", {})
@@ -136,17 +149,28 @@ def resolve_tag_slug(raw: str, tags: list[dict[str, Any]]) -> str | None:
 
 
 def next_tag_after(current_slug: str | None, tags: list[dict[str, Any]]) -> dict[str, Any]:
-    if not tags:
-        raise RuntimeError("Ghost returned no tags")
+    """Next tag by name that has at least one post (empty tags are skipped)."""
     ordered = sorted(tags, key=lambda t: t.get("name", "").casefold())
+    usable = [t for t in ordered if tag_post_count(t) > 0]
+    if not usable:
+        raise RuntimeError("Ghost returned no tags with posts")
     if current_slug is None:
-        return ordered[0]
-    slugs = [t["slug"] for t in ordered]
-    if current_slug not in slugs:
-        log.warning("current tag slug %r not in Ghost — using first tag", current_slug)
-        return ordered[0]
-    idx = slugs.index(current_slug)
-    return ordered[(idx + 1) % len(ordered)]
+        return usable[0]
+    usable_slugs = [t["slug"] for t in usable]
+    if current_slug in usable_slugs:
+        idx = usable_slugs.index(current_slug)
+        return usable[(idx + 1) % len(usable)]
+    by_slug = {t["slug"]: t for t in ordered}
+    current = by_slug.get(current_slug)
+    if current is None:
+        log.warning("current tag slug %r not in Ghost — using first tag with posts", current_slug)
+        return usable[0]
+    cur_name = current.get("name", "").casefold()
+    log.debug("current tag %r has no posts — advancing to next with posts", current_slug)
+    for tag in usable:
+        if tag.get("name", "").casefold() > cur_name:
+            return tag
+    return usable[0]
 
 
 def run_tag_rotation(
@@ -162,6 +186,8 @@ def run_tag_rotation(
             raise RuntimeError(f"Missing {name}")
 
     tags = list_tags()
+    with_posts = sum(1 for t in tags if tag_post_count(t) > 0)
+    log.info("tags: total=%s with_posts=%s empty=%s", len(tags), with_posts, len(tags) - with_posts)
     stored_slug = read_current_tag_slug()
     current_slug = stored_slug
 
@@ -195,13 +221,34 @@ def run_tag_rotation(
     }
 
 
+def write_github_output(result: dict[str, Any]) -> None:
+    """Expose posts URL for workflow environment.url (opens in a new tab in Actions UI)."""
+    path = os.getenv("GITHUB_OUTPUT")
+    if not path:
+        return
+    if result.get("mode") == "set_only":
+        name = result["current"]["name"]
+        slug = result["current"]["slug"]
+        url = result["postsUrl"]
+    else:
+        suggested = result["suggested"]
+        name = suggested["name"]
+        slug = suggested["slug"]
+        url = suggested["postsUrl"]
+    # Heredoc delimiters: tag names may contain spaces / @ / punctuation.
+    with open(path, "a", encoding="utf-8") as handle:
+        handle.write(f"posts_url={url}\n")
+        handle.write(f"tag_slug={slug}\n")
+        handle.write(f"tag_name<<EOF\n{name}\nEOF\n")
+
+
 def format_tag_rotation_summary(result: dict[str, Any]) -> str:
     if result.get("mode") == "set_only":
         current = result["current"]
         nxt = result["nextWouldBe"]
         return (
             f"## Current tag updated\n\n"
-            f"**{current['name']}** (`{current['slug']}`)\n\n"
+            f"{html_blank_link(result['postsUrl'], current['name'])} (`{current['slug']}`)\n\n"
             f"{html_blank_link(result['postsUrl'], 'Open posts in Ghost Admin')}\n\n"
             f"Next rotation will suggest **{nxt['name']}** (`{nxt['slug']}`)."
         )
@@ -209,7 +256,7 @@ def format_tag_rotation_summary(result: dict[str, Any]) -> str:
     prev = result.get("previousSlug") or "(none)"
     return (
         f"## Suggested tag\n\n"
-        f"**{suggested['name']}** (`{suggested['slug']}`)\n\n"
+        f"{html_blank_link(suggested['postsUrl'], suggested['name'])} (`{suggested['slug']}`)\n\n"
         f"{html_blank_link(suggested['postsUrl'], 'Open posts in Ghost Admin')}\n\n"
         f"Previous current tag: `{prev}`"
     )
@@ -635,13 +682,21 @@ def _self_check() -> None:
     html_out, n = scrub_post_html('<p data-ai-generated="yes">Hi\u200b</p>')
     assert n == 2 and "data-ai" not in html_out and "\u200b" not in html_out
     sample_tags = [
-        {"name": "Actiondesk", "slug": "actiondesk"},
-        {"name": "Active@ Partition Manager", "slug": "active-partition-manager"},
-        {"name": "Zeta", "slug": "zeta"},
+        {"name": "Actiondesk", "slug": "actiondesk", "count": {"posts": 1}},
+        {
+            "name": "Active@ Partition Manager",
+            "slug": "active-partition-manager",
+            "count": {"posts": 2},
+        },
+        {"name": "Empty", "slug": "empty", "count": {"posts": 0}},
+        {"name": "Zeta", "slug": "zeta", "count": {"posts": 1}},
     ]
     nxt = next_tag_after("actiondesk", sample_tags)
     assert nxt["slug"] == "active-partition-manager"
+    assert next_tag_after("active-partition-manager", sample_tags)["slug"] == "zeta"
     assert next_tag_after("zeta", sample_tags)["slug"] == "actiondesk"
+    assert next_tag_after("empty", sample_tags)["slug"] == "zeta"
+    assert tag_post_count({"count": {"posts": 0}}) == 0
     assert resolve_tag_slug("Active@ Partition Manager", sample_tags) == "active-partition-manager"
     link = html_blank_link(
         "https://example.com/ghost/#/posts?tag=x",
@@ -688,6 +743,7 @@ if __name__ == "__main__":
             set_current_slug=args.set_current_tag,
             set_only=args.set_only,
         )
+        write_github_output(result)
         summary_md = format_tag_rotation_summary(result)
         log.info("%s", summary_md.replace("## ", "").replace("**", "").replace("\n\n", "\n"))
         summary_path = os.getenv("GITHUB_STEP_SUMMARY")

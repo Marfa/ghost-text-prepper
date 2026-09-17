@@ -451,14 +451,31 @@ def to_jpeg_transform_url(image_url: str) -> str:
     return image_url.replace("/content/images/", "/content/images/size/w1200/format/jpeg/", 1)
 
 
+def one_line(text: str | None, max_len: int = 180) -> str:
+    s = re.sub(r"\s+", " ", str(text or "")).strip()
+    if len(s) <= max_len:
+        return s
+    return f"{s[: max_len - 1].rstrip()}…"
+
+
+def description_has_newlines(post: dict[str, Any]) -> bool:
+    for key in ("og_description", "meta_description", "twitter_description", "custom_excerpt"):
+        val = post.get(key) or ""
+        if "\n" in val or "\r" in val:
+            return True
+    return False
+
+
 def needs_telegram_og_fix(post: dict[str, Any], *, enabled: bool | None = None) -> bool:
     if enabled is None:
         enabled = FIX_TELEGRAM_OG
     if not enabled:
         return False
     og = post.get("og_image") or ""
-    if is_jpeg_url(og):
+    if is_jpeg_url(og) and not description_has_newlines(post):
         return False
+    if description_has_newlines(post):
+        return True
     source = og or (post.get("feature_image") or "")
     return is_png_url(source)
 
@@ -484,22 +501,45 @@ def upload_jpeg_image(jpeg_bytes: bytes, filename: str) -> str:
 
 
 def build_telegram_og_fields(post: dict[str, Any], *, enabled: bool | None = None) -> dict[str, Any]:
-    """Download Ghost JPEG transform of PNG cover, re-upload as .jpg, return og/twitter fields."""
+    """Ensure .jpg og/twitter images and one-line social descriptions for Telegram."""
     if not needs_telegram_og_fix(post, enabled=enabled):
         return {}
-    source = (post.get("og_image") or post.get("feature_image") or "").strip()
-    if not source:
-        return {}
-    transform = to_jpeg_transform_url(source)
-    response = http.get(transform, headers={"User-Agent": "TelegramBot (like TwitterBot)"})
-    response.raise_for_status()
-    jpeg_bytes = response.content
-    if len(jpeg_bytes) < 100 or jpeg_bytes[:2] != b"\xff\xd8":
-        raise RuntimeError(f"transform is not JPEG for {post.get('slug')}: {transform}")
-    slug = (post.get("slug") or post.get("id") or "post").strip() or "post"
-    uploaded = upload_jpeg_image(jpeg_bytes, f"{slug}-og.jpg")
-    log.info("telegram og %s → %s", slug, uploaded)
-    return {"og_image": uploaded, "twitter_image": uploaded}
+    fields: dict[str, Any] = {}
+
+    og = post.get("og_image") or ""
+    if not is_jpeg_url(og):
+        source = (og or post.get("feature_image") or "").strip()
+        if is_png_url(source):
+            transform = to_jpeg_transform_url(source)
+            response = http.get(transform, headers={"User-Agent": "TelegramBot (like TwitterBot)"})
+            response.raise_for_status()
+            jpeg_bytes = response.content
+            if len(jpeg_bytes) < 100 or jpeg_bytes[:2] != b"\xff\xd8":
+                raise RuntimeError(f"transform is not JPEG for {post.get('slug')}: {transform}")
+            slug = (post.get("slug") or post.get("id") or "post").strip() or "post"
+            uploaded = upload_jpeg_image(jpeg_bytes, f"{slug}-og.jpg")
+            log.info("telegram og %s → %s", slug, uploaded)
+            fields["og_image"] = uploaded
+            fields["twitter_image"] = uploaded
+
+    if description_has_newlines(post):
+        desc = one_line(
+            post.get("og_description")
+            or post.get("meta_description")
+            or post.get("custom_excerpt")
+            or post.get("excerpt")
+            or post.get("title")
+        )
+        if desc:
+            fields["og_description"] = desc
+            fields["meta_description"] = desc
+            fields["twitter_description"] = desc
+            # custom_excerpt feeds ghost_head when SEO fields empty — keep it one-line too
+            if post.get("custom_excerpt") and ("\n" in (post.get("custom_excerpt") or "") or "\r" in (post.get("custom_excerpt") or "")):
+                fields["custom_excerpt"] = desc
+            log.info("telegram desc %s → %s chars", post.get("slug"), len(desc))
+
+    return fields
 
 
 def list_posts(post_filter: str) -> list[dict[str, Any]]:
@@ -545,7 +585,8 @@ def fix_telegram_og_on_posts(
                     "slug": saved.get("slug") or post.get("slug"),
                     "updated": True,
                     "telegram_og": True,
-                    "og_image": fields["og_image"],
+                    **({"og_image": fields["og_image"]} if fields.get("og_image") else {}),
+                    **({"desc_fixed": True} if fields.get("og_description") else {}),
                 }
             )
         except Exception as exc:
@@ -566,9 +607,10 @@ def run_telegram_og_fix(
     *,
     all_png: bool = False,
     since: datetime | None = None,
+    recent_hours: int | None = None,
     force: bool = False,
 ) -> dict[str, Any]:
-    """Re-upload PNG covers as .jpg og_image for drafts/published posts."""
+    """Re-upload PNG covers as .jpg og_image and normalize multiline social descriptions."""
     for name, value in {"GHOST_URL": GHOST_URL, "GHOST_ADMIN_API_KEY": GHOST_KEY}.items():
         if not value:
             raise RuntimeError(f"Missing {name}")
@@ -578,9 +620,14 @@ def run_telegram_og_fix(
         return {"candidates": 0, "updated": 0, "errors": 0, "results": []}
     if all_png:
         posts = list_posts("status:[draft,published]")
+    elif recent_hours is not None:
+        since_dt = datetime.now(timezone.utc).timestamp() - recent_hours * 3600
+        since = datetime.fromtimestamp(since_dt, tz=timezone.utc)
+        since_iso = to_ghost_filter_date(since)
+        posts = list_posts(f"status:[draft,published]+updated_at:>'{since_iso}'")
     else:
         if since is None:
-            raise RuntimeError("since required unless all_png")
+            raise RuntimeError("since required unless all_png/recent_hours")
         since_iso = to_ghost_filter_date(since)
         posts = list_posts(f"status:published+updated_at:>'{since_iso}'")
     targets = [p for p in posts if needs_telegram_og_fix(p, enabled=True)]
@@ -739,7 +786,7 @@ def process_post(post: dict[str, Any]) -> dict[str, Any]:
     fields: dict[str, Any] = {}
     excerpt = ""
     if excerpt_needed and len(body) >= 40:
-        excerpt = generate_excerpt(title_clean, body)
+        excerpt = one_line(generate_excerpt(title_clean, body), MAX_EXCERPT_LEN)
         fields.update(
             {
                 "custom_excerpt": excerpt,
@@ -768,9 +815,10 @@ def process_post(post: dict[str, Any]) -> dict[str, Any]:
         result["excerpt"] = excerpt
     if marks_removed:
         result["marks_removed"] = marks_removed
-    if fields.get("og_image"):
+    if fields.get("og_image") or fields.get("og_description"):
         result["telegram_og"] = True
-        result["og_image"] = fields["og_image"]
+        if fields.get("og_image"):
+            result["og_image"] = fields["og_image"]
     return result
 
 
@@ -902,6 +950,9 @@ def _self_check() -> None:
     )
     assert "/size/w1200/format/jpeg/" in transformed
     assert transformed.endswith("cover.png")
+    assert one_line("a\n\nb  c", 180) == "a b c"
+    assert description_has_newlines({"custom_excerpt": "a\nb"}) is True
+    assert description_has_newlines({"custom_excerpt": "ab"}) is False
     log.info("self-check ok")
 
 
@@ -915,6 +966,14 @@ if __name__ == "__main__":
         "--fix-telegram-og",
         action="store_true",
         help="re-upload PNG covers as real .jpg og_image/twitter_image (all drafts+published)",
+    )
+    parser.add_argument(
+        "--fix-telegram-og-recent",
+        type=int,
+        nargs="?",
+        const=6,
+        metavar="HOURS",
+        help="fix Telegram OG for posts updated in the last N hours (default 6)",
     )
     parser.add_argument("--tag-rotate", action="store_true", help="suggest next Ghost tag")
     parser.add_argument(
@@ -933,9 +992,15 @@ if __name__ == "__main__":
         _self_check()
         sys.exit(0)
 
-    if args.fix_telegram_og:
+    if args.fix_telegram_og or args.fix_telegram_og_recent is not None:
         _self_check()
-        summary = run_telegram_og_fix(all_png=True, force=True)
+        if args.fix_telegram_og:
+            summary = run_telegram_og_fix(all_png=True, force=True)
+        else:
+            summary = run_telegram_og_fix(
+                recent_hours=int(args.fix_telegram_og_recent),
+                force=True,
+            )
         log.info(
             "telegram og done: candidates=%s updated=%s errors=%s",
             summary["candidates"],

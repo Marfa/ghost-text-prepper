@@ -1,0 +1,37 @@
+name: Hourly Telegram OG fix
+
+on:
+  schedule:
+    # Catch PNG covers / multiline excerpts soon after publish (before Telegram caches a miss)
+    - cron: "20 * * * *"
+  workflow_dispatch:
+    inputs:
+      hours:
+        description: "Look back window in hours"
+        required: true
+        default: "6"
+
+permissions:
+  contents: read
+
+jobs:
+  telegram-og:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      - name: Fix recent Telegram OG images
+        env:
+          GHOST_URL: ${{ vars.GHOST_URL }}
+          GHOST_ADMIN_API_KEY: ${{ secrets.GHOST_ADMIN_API_KEY }}
+          FIX_TELEGRAM_OG: "1"
+        run: |
+          HOURS="${{ github.event.inputs.hours || '6' }}"
+          python app.py --fix-telegram-og-recent "$HOURS"

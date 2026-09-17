@@ -40,7 +40,9 @@ python app.py --fix-telegram-og
 
 Посты с уже заполненным excerpt всё равно чистятся, если в HTML/заголовке есть пометки, или если нужна Telegram OG-картинка.
 
-В том же окне `updated_at` чинятся и **published** посты с PNG-обложкой (`FIX_TELEGRAM_OG=1`).
+В том же окне `updated_at` чинятся и **published** посты с PNG-обложкой или многострочным excerpt (`FIX_TELEGRAM_OG=1`).
+
+Дополнительно каждый час: workflow **Hourly Telegram OG fix** (`python app.py --fix-telegram-og-recent 6`), чтобы поймать обложку до того, как Telegram закэширует пустое превью.
 
 ## Автоматизация
 

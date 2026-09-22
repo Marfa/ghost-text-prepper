@@ -603,6 +603,26 @@ def fix_telegram_og_on_posts(
     return results
 
 
+def fix_telegram_og_slug(slug: str) -> dict[str, Any]:
+    for name, value in {"GHOST_URL": GHOST_URL, "GHOST_ADMIN_API_KEY": GHOST_KEY}.items():
+        if not value:
+            raise RuntimeError(f"Missing {name}")
+    data = _ghost("GET", f"posts/slug/{slug}/")
+    post = (data.get("posts") or [None])[0]
+    if not post:
+        raise RuntimeError(f"post not found: {slug}")
+    results = fix_telegram_og_on_posts([post], enabled=True)
+    if not results:
+        return {"candidates": 0, "updated": 0, "errors": 0, "results": [], "slug": slug}
+    return {
+        "candidates": 1,
+        "updated": sum(1 for r in results if r.get("updated")),
+        "errors": sum(1 for r in results if r.get("error")),
+        "results": results,
+        "slug": slug,
+    }
+
+
 def run_telegram_og_fix(
     *,
     all_png: bool = False,
@@ -975,6 +995,11 @@ if __name__ == "__main__":
         metavar="HOURS",
         help="fix Telegram OG for posts updated in the last N hours (default 6)",
     )
+    parser.add_argument(
+        "--fix-telegram-og-slug",
+        metavar="SLUG",
+        help="fix Telegram OG for a single post slug",
+    )
     parser.add_argument("--tag-rotate", action="store_true", help="suggest next Ghost tag")
     parser.add_argument(
         "--set-current-tag",
@@ -992,9 +1017,11 @@ if __name__ == "__main__":
         _self_check()
         sys.exit(0)
 
-    if args.fix_telegram_og or args.fix_telegram_og_recent is not None:
+    if args.fix_telegram_og or args.fix_telegram_og_recent is not None or args.fix_telegram_og_slug:
         _self_check()
-        if args.fix_telegram_og:
+        if args.fix_telegram_og_slug:
+            summary = fix_telegram_og_slug(args.fix_telegram_og_slug)
+        elif args.fix_telegram_og:
             summary = run_telegram_og_fix(all_png=True, force=True)
         else:
             summary = run_telegram_og_fix(

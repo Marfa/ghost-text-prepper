@@ -34,7 +34,36 @@ python app.py
 python app.py --fix-telegram-og
 ```
 
-## Инкрементальный режим
+Один пост:
+
+```bash
+python app.py --fix-telegram-og-slug kak-besplatno-nastroit-sinkhronizatsiiu-obsidian-s-pomoshchiu-livesync
+```
+
+## Telegram / WebpageBot
+
+Telegram кэширует превью в момент **первого** запроса. Отложенное сообщение боту со ссылкой на ещё не опубликованный пост в момент отправки часто застаёт PNG-обложку → пустой кэш. `@WebpageBot` потом пишет success, но карточку не показывает; помогает `?v=1` в Saved Messages.
+
+Автофиксы:
+
+| Что | Когда |
+| --- | --- |
+| Daily prep | черновики + published в окне `lastRunAt` |
+| Actions cron `*/5` | посты, обновлённые за последние 2 часа |
+| Cloudflare Worker (рекомендуется) | сразу на `post.published` / `post.scheduled` / `post.edited` |
+
+### Worker (мгновенно при публикации)
+
+```bash
+cd cloudflare-worker
+npx wrangler secret put GHOST_URL          # https://xxx.ghost.io
+npx wrangler secret put GHOST_ADMIN_API_KEY
+npx wrangler deploy
+WEBHOOK_TARGET_URL=https://ghost-telegram-og-webhook.<you>.workers.dev/ \
+  python scripts/register-telegram-og-webhooks.py
+```
+
+Пока Worker не задеплоен: планируй сообщение в Telegram **минимум на +5–10 минут** после времени публикации в Ghost.
 
 `state/last-run.json` — только черновики с `updated_at` после `lastRunAt`. Свежий baseline ничего не обрабатывает.
 
@@ -42,7 +71,7 @@ python app.py --fix-telegram-og
 
 В том же окне `updated_at` чинятся и **published** посты с PNG-обложкой или многострочным excerpt (`FIX_TELEGRAM_OG=1`).
 
-Дополнительно каждый час: workflow **Hourly Telegram OG fix** (`python app.py --fix-telegram-og-recent 6`), чтобы поймать обложку до того, как Telegram закэширует пустое превью.
+Cron **каждые 5 минут**: workflow **Telegram OG fix (frequent)**.
 
 ## Автоматизация
 

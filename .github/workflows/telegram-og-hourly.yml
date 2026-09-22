@@ -1,15 +1,21 @@
-name: Hourly Telegram OG fix
+name: Telegram OG fix (frequent)
 
 on:
   schedule:
-    # Catch PNG covers / multiline excerpts soon after publish (before Telegram caches a miss)
-    - cron: "20 * * * *"
+    # Race: scheduled TG messages often fire right after Ghost publish.
+    # 5-minute window keeps .jpg og_image ready for almost all cases;
+    # Cloudflare Worker webhook covers same-minute publishes (see README).
+    - cron: "*/5 * * * *"
   workflow_dispatch:
     inputs:
       hours:
         description: "Look back window in hours"
         required: true
-        default: "6"
+        default: "2"
+      slug:
+        description: "Optional single post slug to fix"
+        required: false
+        default: ""
 
 permissions:
   contents: read
@@ -27,11 +33,16 @@ jobs:
 
       - run: pip install -r requirements.txt
 
-      - name: Fix recent Telegram OG images
+      - name: Fix Telegram OG images
         env:
           GHOST_URL: ${{ vars.GHOST_URL }}
           GHOST_ADMIN_API_KEY: ${{ secrets.GHOST_ADMIN_API_KEY }}
           FIX_TELEGRAM_OG: "1"
         run: |
-          HOURS="${{ github.event.inputs.hours || '6' }}"
-          python app.py --fix-telegram-og-recent "$HOURS"
+          SLUG="${{ github.event.inputs.slug }}"
+          if [ -n "$SLUG" ]; then
+            python app.py --fix-telegram-og-slug "$SLUG"
+          else
+            HOURS="${{ github.event.inputs.hours || '2' }}"
+            python app.py --fix-telegram-og-recent "$HOURS"
+          fi

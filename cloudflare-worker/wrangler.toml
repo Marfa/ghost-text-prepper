@@ -1,0 +1,8 @@
+name = "ghost-telegram-og-webhook"
+main = "telegram-og-webhook.js"
+compatibility_date = "2026-09-01"
+
+# Secrets (wrangler secret put):
+#   GHOST_URL
+#   GHOST_ADMIN_API_KEY
+#   WEBHOOK_SECRET   (optional)

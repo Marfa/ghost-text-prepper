@@ -63,7 +63,7 @@ WEBHOOK_TARGET_URL=https://ghost-telegram-og-webhook.<you>.workers.dev/ \
   python scripts/register-telegram-og-webhooks.py
 ```
 
-Пока Worker не задеплоен: планируй сообщение в Telegram **минимум на +5–10 минут** после времени публикации в Ghost.
+Пока Worker не задеплоен: планируй сообщение в Telegram **минимум на +1 час** после публикации в Ghost (cron чинит OG каждые 30 минут).
 
 `state/last-run.json` — только черновики с `updated_at` после `lastRunAt`. Свежий baseline ничего не обрабатывает.
 

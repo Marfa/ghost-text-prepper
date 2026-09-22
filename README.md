@@ -49,7 +49,7 @@ Telegram кэширует превью в момент **первого** зап
 | Что | Когда |
 | --- | --- |
 | Daily prep | черновики + published в окне `lastRunAt` |
-| Actions cron `*/5` | посты, обновлённые за последние 2 часа |
+| Actions cron `*/30` | посты, обновлённые за последние 2 часа |
 | Cloudflare Worker (рекомендуется) | сразу на `post.published` / `post.scheduled` / `post.edited` |
 
 ### Worker (мгновенно при публикации)
@@ -71,7 +71,7 @@ WEBHOOK_TARGET_URL=https://ghost-telegram-og-webhook.<you>.workers.dev/ \
 
 В том же окне `updated_at` чинятся и **published** посты с PNG-обложкой или многострочным excerpt (`FIX_TELEGRAM_OG=1`).
 
-Cron **каждые 5 минут**: workflow **Telegram OG fix (frequent)**.
+Cron **каждые 30 минут**: workflow **Telegram OG fix (frequent)**.
 
 ## Автоматизация
 

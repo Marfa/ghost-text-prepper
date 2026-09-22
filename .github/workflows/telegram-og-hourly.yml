@@ -2,10 +2,8 @@ name: Telegram OG fix (frequent)
 
 on:
   schedule:
-    # Race: scheduled TG messages often fire right after Ghost publish.
-    # 5-minute window keeps .jpg og_image ready for almost all cases;
-    # Cloudflare Worker webhook covers same-minute publishes (see README).
-    - cron: "*/5 * * * *"
+    # +1h Telegram delay after publish — 30 min is enough to convert PNG → .jpg og_image
+    - cron: "*/30 * * * *"
   workflow_dispatch:
     inputs:
       hours:

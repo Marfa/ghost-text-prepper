@@ -1,6 +1,6 @@
 """Prep Ghost draft posts: strip AI Unicode marks, then SEO/social excerpt.
 
-Also: cover image via BotHub when a post becomes published.
+Also: cover image via BotHub when a draft is scheduled.
 """
 
 from __future__ import annotations
@@ -443,10 +443,14 @@ def list_drafts(since: datetime) -> list[dict[str, Any]]:
     return posts
 
 
-def list_published_since(since: datetime) -> list[dict[str, Any]]:
-    """Posts that became published after ``since`` (publish transition window)."""
+def list_scheduled_since(since: datetime) -> list[dict[str, Any]]:
+    """Scheduled posts updated after ``since`` (draft → scheduled window).
+
+    Uses ``updated_at`` (not ``published_at``): on schedule, ``published_at`` is the
+    future go-live time and would match every future post on every run.
+    """
     since_iso = to_ghost_filter_date(since)
-    post_filter = f"status:published+published_at:>'{since_iso}'"
+    post_filter = f"status:scheduled+updated_at:>'{since_iso}'"
     posts: list[dict[str, Any]] = []
     page = 1
     while True:
@@ -456,7 +460,7 @@ def list_published_since(since: datetime) -> list[dict[str, Any]]:
             params={
                 "filter": post_filter,
                 "formats": "html",
-                "order": "published_at asc",
+                "order": "updated_at asc",
                 "limit": 50,
                 "page": page,
             },
@@ -766,8 +770,8 @@ def telegram_one_line_description_fields(post: dict[str, Any]) -> dict[str, Any]
     return fields
 
 
-def process_published_cover(post: dict[str, Any]) -> dict[str, Any]:
-    """Generate BotHub cover and store Telegram/OG-safe ``.jpg`` feature + social images."""
+def process_scheduled_cover(post: dict[str, Any]) -> dict[str, Any]:
+    """Generate BotHub cover for a scheduled post; store Telegram/OG-safe ``.jpg`` images."""
     post_id = post["id"]
     title = post.get("title") or "Untitled"
     if not needs_cover(post):
@@ -1155,16 +1159,19 @@ def run() -> dict[str, Any]:
     run_started_at = datetime.now(timezone.utc)
     last_run_at = read_last_run()
     if last_run_at is None:
-        log.info("first run — no state yet, baseline only (no drafts processed)")
+        log.info("first run — no state yet, baseline only (no drafts/covers processed)")
         write_last_run(run_started_at)
         return {
             "since": None,
             "first_run": True,
             "drafts": 0,
+            "scheduled": 0,
             "updated": 0,
+            "covers": 0,
             "skipped": 0,
             "errors": 0,
             "results": [],
+            "cover_results": [],
         }
 
     since_iso = to_ghost_filter_date(last_run_at)
@@ -1185,14 +1192,14 @@ def run() -> dict[str, Any]:
             time.sleep(2.5 if _hf_skip_run else 1)
 
     cover_results: list[dict[str, Any]] = []
-    published: list[dict[str, Any]] = []
+    scheduled: list[dict[str, Any]] = []
     if BOTHUB_API_KEY:
-        log.info("collecting published posts after %s for covers", since_iso)
-        published = list_published_since(last_run_at)
-        log.info("found %s published post(s) in window", len(published))
-        for i, post in enumerate(published):
+        log.info("collecting scheduled posts after %s for covers", since_iso)
+        scheduled = list_scheduled_since(last_run_at)
+        log.info("found %s scheduled post(s) in window", len(scheduled))
+        for i, post in enumerate(scheduled):
             try:
-                result = process_published_cover(post)
+                result = process_scheduled_cover(post)
                 cover_results.append(result)
                 log.info("cover %s: %s", post.get("id"), result)
             except Exception as exc:
@@ -1200,10 +1207,10 @@ def run() -> dict[str, Any]:
                 cover_results.append(
                     {"id": post.get("id"), "title": post.get("title"), "error": str(exc)}
                 )
-            if i + 1 < len(published):
+            if i + 1 < len(scheduled):
                 time.sleep(1.5)
     else:
-        log.info("BOTHUB_API_KEY unset — skipping published cover generation")
+        log.info("BOTHUB_API_KEY unset — skipping scheduled cover generation")
 
     if FIX_TELEGRAM_OG:
         # Published posts updated in the same window (covers set after draft prep).
@@ -1228,7 +1235,7 @@ def run() -> dict[str, Any]:
         "since": since_iso,
         "first_run": False,
         "drafts": len(drafts),
-        "published": len(published),
+        "scheduled": len(scheduled),
         "updated": sum(1 for r in results if r.get("updated")),
         "covers": sum(1 for r in cover_results if r.get("cover")),
         "skipped": sum(1 for r in results if r.get("skipped"))
@@ -1414,9 +1421,11 @@ if __name__ == "__main__":
     _self_check()
     summary = run()
     log.info(
-        "done: drafts=%s updated=%s skipped=%s errors=%s",
+        "done: drafts=%s scheduled=%s updated=%s covers=%s skipped=%s errors=%s",
         summary["drafts"],
+        summary.get("scheduled", 0),
         summary["updated"],
+        summary.get("covers", 0),
         summary["skipped"],
         summary["errors"],
     )

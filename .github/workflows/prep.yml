@@ -32,8 +32,11 @@ jobs:
           HF_TEXT_MODEL: ${{ vars.HF_TEXT_MODEL }}
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
           GROQ_TEXT_MODEL: ${{ vars.GROQ_TEXT_MODEL }}
+          BOTHUB_API_KEY: ${{ secrets.BOTHUB_API_KEY }}
+          BOTHUB_IMAGE_MODEL: ${{ vars.BOTHUB_IMAGE_MODEL }}
           MAX_EXCERPT_LEN: "146"
           SKIP_COMPLETE: "1"
+          SKIP_COVER_COMPLETE: "1"
           FIX_TELEGRAM_OG: "1"
         run: python app.py
 

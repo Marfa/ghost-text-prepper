@@ -1,7 +1,11 @@
-"""Prep Ghost draft posts: strip AI Unicode marks, then SEO/social excerpt."""
+"""Prep Ghost draft posts: strip AI Unicode marks, then SEO/social excerpt.
+
+Also: cover image via BotHub when a post becomes published.
+"""
 
 from __future__ import annotations
 
+import base64
 import html
 import json
 import logging
@@ -13,6 +17,7 @@ from datetime import datetime, timezone
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any, Optional
+from urllib.parse import urlparse
 
 import httpx
 import jwt
@@ -34,9 +39,14 @@ HF_TOKEN = _env("HF_TOKEN")
 HF_TEXT_MODEL = _env("HF_TEXT_MODEL", "openai/gpt-oss-20b")
 GROQ_API_KEY = _env("GROQ_API_KEY")
 GROQ_TEXT_MODEL = _env("GROQ_TEXT_MODEL", "openai/gpt-oss-20b")
+BOTHUB_API_KEY = _env("BOTHUB_API_KEY")
+BOTHUB_BASE_URL = _env("BOTHUB_BASE_URL", "https://bothub.chat/api/v2/openai/v1").rstrip("/")
+# Nano Banana 2 on BotHub == Google gemini-3.1-flash-image
+BOTHUB_IMAGE_MODEL = _env("BOTHUB_IMAGE_MODEL", "gemini-3.1-flash-image")
 
 MAX_EXCERPT_LEN = int(_env("MAX_EXCERPT_LEN", "146"))
 SKIP_COMPLETE = _env("SKIP_COMPLETE", "1") not in ("0", "false", "False")
+SKIP_COVER_COMPLETE = _env("SKIP_COVER_COMPLETE", "1") not in ("0", "false", "False")
 # Telegram WebpageBot rejects JPEG bytes under a .png URL; re-upload real .jpg for og/twitter.
 FIX_TELEGRAM_OG = _env("FIX_TELEGRAM_OG", "1") not in ("0", "false", "False")
 STATE_FILE = Path(_env("STATE_FILE", "state/last-run.json"))
@@ -45,8 +55,15 @@ _PNG_URL_RE = re.compile(r"\.png(?:\?|$)", re.I)
 _JPEG_URL_RE = re.compile(r"\.jpe?g(?:\?|$)", re.I)
 
 _MAX_ARTICLE_CHARS = 6000
+_MAX_COVER_TOPIC_CHARS = 800
+_DATA_URL_RE = re.compile(
+    r"data:(image/(?:png|jpeg|jpg|webp));base64,([A-Za-z0-9+/=\s]+)",
+    re.I,
+)
 
 http = httpx.Client(timeout=httpx.Timeout(30.0, read=180.0))
+# Image models can take longer than excerpt chat.
+http_image = httpx.Client(timeout=httpx.Timeout(60.0, read=300.0))
 
 # ponytail: skip HF for the rest of the run after 402 credits; reset in run().
 _hf_skip_run = False
@@ -426,12 +443,254 @@ def list_drafts(since: datetime) -> list[dict[str, Any]]:
     return posts
 
 
+def list_published_since(since: datetime) -> list[dict[str, Any]]:
+    """Posts that became published after ``since`` (publish transition window)."""
+    since_iso = to_ghost_filter_date(since)
+    post_filter = f"status:published+published_at:>'{since_iso}'"
+    posts: list[dict[str, Any]] = []
+    page = 1
+    while True:
+        data = _ghost(
+            "GET",
+            "posts/",
+            params={
+                "filter": post_filter,
+                "formats": "html",
+                "order": "published_at asc",
+                "limit": 50,
+                "page": page,
+            },
+        )
+        posts.extend(data["posts"])
+        pagination = data.get("meta", {}).get("pagination", {})
+        if page >= pagination.get("pages", 1):
+            break
+        page += 1
+    return posts
+
+
 def update_post(post_id: str, updated_at: str, fields: dict[str, Any]) -> dict[str, Any]:
     payload = {"posts": [{**fields, "updated_at": updated_at}]}
     kwargs: dict[str, Any] = {"json": payload}
     if "html" in fields:
         kwargs["params"] = {"source": "html"}
     return _ghost("PUT", f"posts/{post_id}/", **kwargs)["posts"][0]
+
+
+def needs_cover(post: dict[str, Any]) -> bool:
+    if not SKIP_COVER_COMPLETE:
+        return True
+    return not bool((post.get("feature_image") or "").strip())
+
+
+def build_cover_prompt(title: str, body: str) -> str:
+    """Visual cover prompt from post topic; forbids glyphs/text in the image."""
+    topic = re.sub(r"\s+", " ", (body or "").strip())[:_MAX_COVER_TOPIC_CHARS].strip()
+    title_clean = re.sub(r"\s+", " ", (title or "Untitled").strip())
+    parts = [
+        "Create a single editorial blog cover illustration.",
+        f"Topic / subject: {title_clean}.",
+    ]
+    if topic:
+        parts.append(f"Article context (for mood and motif only): {topic}")
+    parts.append(
+        "Widescreen 16:9 composition, atmospheric, cohesive color palette, "
+        "suitable as a feature image for a tech/product blog."
+    )
+    parts.append(
+        "Strict rules: no text, letters, words, numbers, typography, watermarks, "
+        "logos, UI chrome, captions, or signatures anywhere in the image."
+    )
+    return " ".join(parts)
+
+
+def _guess_image_meta(raw: bytes) -> tuple[str, str]:
+    if raw.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png", "cover.png"
+    if raw.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg", "cover.jpg"
+    if raw.startswith(b"RIFF") and b"WEBP" in raw[:16]:
+        return "image/webp", "cover.webp"
+    return "image/png", "cover.png"
+
+
+def _bytes_from_data_url(url: str) -> bytes | None:
+    match = _DATA_URL_RE.search(url or "")
+    if not match:
+        return None
+    try:
+        return base64.b64decode(re.sub(r"\s+", "", match.group(2)))
+    except Exception:
+        return None
+
+
+def _download_image_url(url: str) -> bytes:
+    response = http_image.get(url)
+    if response.is_error:
+        log.error("download cover → %s %s", response.status_code, response.text[:300])
+    response.raise_for_status()
+    return response.content
+
+
+def _image_bytes_from_generations_payload(data: dict[str, Any]) -> bytes:
+    items = data.get("data") or []
+    if not items:
+        raise RuntimeError(f"BotHub images/generations returned no data: {str(data)[:400]}")
+    item = items[0]
+    b64 = item.get("b64_json")
+    if b64:
+        return base64.b64decode(b64)
+    url = (item.get("url") or "").strip()
+    if url.startswith("data:"):
+        decoded = _bytes_from_data_url(url)
+        if decoded:
+            return decoded
+    if url:
+        return _download_image_url(url)
+    raise RuntimeError(f"BotHub image item missing b64_json/url: {str(item)[:400]}")
+
+
+def _image_bytes_from_chat_payload(data: dict[str, Any]) -> bytes:
+    message = (data.get("choices") or [{}])[0].get("message") or {}
+    content = message.get("content")
+    # OpenAI-style multimodal content parts
+    if isinstance(content, list):
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            if part.get("type") == "image_url":
+                url = (part.get("image_url") or {}).get("url") or part.get("url") or ""
+                if url.startswith("data:"):
+                    decoded = _bytes_from_data_url(url)
+                    if decoded:
+                        return decoded
+                if url.startswith("http"):
+                    return _download_image_url(url)
+            b64 = part.get("inline_data") or part.get("b64_json")
+            if isinstance(b64, dict):
+                b64 = b64.get("data")
+            if isinstance(b64, str) and len(b64) > 64:
+                try:
+                    return base64.b64decode(b64)
+                except Exception:
+                    pass
+    if isinstance(content, str):
+        decoded = _bytes_from_data_url(content)
+        if decoded:
+            return decoded
+        urls = re.findall(r"https?://[^\s)\"']+\.(?:png|jpe?g|webp)", content, flags=re.I)
+        if urls:
+            return _download_image_url(urls[0])
+    raise RuntimeError(f"BotHub chat completion had no image: {str(data)[:500]}")
+
+
+def generate_cover_image(prompt: str) -> bytes:
+    """Generate cover bytes via BotHub (OpenAI-compatible images, chat fallback)."""
+    if not BOTHUB_API_KEY:
+        raise RuntimeError("Missing BOTHUB_API_KEY")
+    headers = {
+        "Authorization": f"Bearer {BOTHUB_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    gen_body: dict[str, Any] = {
+        "model": BOTHUB_IMAGE_MODEL,
+        "prompt": prompt,
+        "n": 1,
+        "size": "1792x1024",
+        "response_format": "b64_json",
+        "aspect_ratio": "16:9",
+    }
+    response = http_image.post(
+        f"{BOTHUB_BASE_URL}/images/generations",
+        headers=headers,
+        json=gen_body,
+    )
+    if response.status_code in (404, 405):
+        log.info("BotHub images/generations unavailable — trying chat.completions")
+    elif response.is_error:
+        log.warning(
+            "BotHub images/generations → %s %s — trying chat.completions",
+            response.status_code,
+            response.text[:400],
+        )
+    else:
+        return _image_bytes_from_generations_payload(response.json())
+
+    chat_body = {
+        "model": BOTHUB_IMAGE_MODEL,
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": 1024,
+    }
+    chat = http_image.post(
+        f"{BOTHUB_BASE_URL}/chat/completions",
+        headers=headers,
+        json=chat_body,
+    )
+    if chat.is_error:
+        log.error("BotHub chat.completions → %s %s", chat.status_code, chat.text[:500])
+    chat.raise_for_status()
+    return _image_bytes_from_chat_payload(chat.json())
+
+
+def upload_ghost_image(raw: bytes, filename: str | None = None) -> str:
+    """Upload image bytes to Ghost; return CDN/content URL."""
+    content_type, default_name = _guess_image_meta(raw)
+    name = filename or default_name
+    response = http.post(
+        f"{GHOST_URL}/ghost/api/admin/images/upload/",
+        headers={
+            "Authorization": f"Ghost {_ghost_token(GHOST_KEY)}",
+            "Accept-Version": "v5.0",
+        },
+        files={"file": (name, raw, content_type)},
+        data={"purpose": "image", "ref": name},
+    )
+    if response.is_error:
+        log.error("ghost image upload → %s %s", response.status_code, response.text[:500])
+    response.raise_for_status()
+    images = response.json().get("images") or []
+    if not images or not images[0].get("url"):
+        raise RuntimeError(f"Ghost image upload missing url: {response.text[:400]}")
+    return str(images[0]["url"])
+
+
+def process_published_cover(post: dict[str, Any]) -> dict[str, Any]:
+    post_id = post["id"]
+    title = post.get("title") or "Untitled"
+    if not needs_cover(post):
+        return {"id": post_id, "title": title, "skipped": True, "reason": "cover already set"}
+
+    html_raw = post.get("html") or ""
+    body = html_to_text(html_raw)
+    if len(body) < 40 and len(title.strip()) < 3:
+        return {"id": post_id, "title": title, "skipped": True, "reason": "body too short"}
+
+    prompt = build_cover_prompt(title, body)
+    raw = generate_cover_image(prompt)
+    if len(raw) < 100:
+        raise RuntimeError("BotHub returned empty/too-small image")
+
+    slug = (post.get("slug") or post_id)[:60]
+    _, ext_name = _guess_image_meta(raw)
+    # Prefer .jpg when BotHub returns JPEG (Telegram-friendly); PNG stays .png
+    # and FIX_TELEGRAM_OG will re-upload a real .jpg for og/twitter.
+    ext = Path(ext_name).suffix or ".png"
+    url = upload_ghost_image(raw, filename=f"cover-{slug}{ext}")
+    fields = {
+        "feature_image": url,
+        "og_image": url,
+        "twitter_image": url,
+    }
+    saved = update_post(post_id, post["updated_at"], fields)
+    return {
+        "id": post_id,
+        "title": title,
+        "updated": True,
+        "cover": True,
+        "slug": saved.get("slug"),
+        "image_url": url,
+        "host": urlparse(url).netloc,
+    }
 
 
 def is_png_url(url: str | None) -> bool:
@@ -887,6 +1146,27 @@ def run() -> dict[str, Any]:
             # Free Groq is ~30 RPM; 2.5s when on HF-skip/Groq path stays under the limit.
             time.sleep(2.5 if _hf_skip_run else 1)
 
+    cover_results: list[dict[str, Any]] = []
+    published: list[dict[str, Any]] = []
+    if BOTHUB_API_KEY:
+        log.info("collecting published posts after %s for covers", since_iso)
+        published = list_published_since(last_run_at)
+        log.info("found %s published post(s) in window", len(published))
+        for i, post in enumerate(published):
+            try:
+                result = process_published_cover(post)
+                cover_results.append(result)
+                log.info("cover %s: %s", post.get("id"), result)
+            except Exception as exc:
+                log.exception("cover %s failed", post.get("id"))
+                cover_results.append(
+                    {"id": post.get("id"), "title": post.get("title"), "error": str(exc)}
+                )
+            if i + 1 < len(published):
+                time.sleep(1.5)
+    else:
+        log.info("BOTHUB_API_KEY unset — skipping published cover generation")
+
     if FIX_TELEGRAM_OG:
         # Published posts updated in the same window (covers set after draft prep).
         pub = run_telegram_og_fix(since=last_run_at)
@@ -898,7 +1178,9 @@ def run() -> dict[str, Any]:
             pub["errors"],
         )
 
-    errors = sum(1 for r in results if r.get("error"))
+    errors = sum(1 for r in results if r.get("error")) + sum(
+        1 for r in cover_results if r.get("error")
+    )
     if errors:
         log.warning("not updating last-run — %s error(s), will retry same window next run", errors)
     else:
@@ -908,11 +1190,15 @@ def run() -> dict[str, Any]:
         "since": since_iso,
         "first_run": False,
         "drafts": len(drafts),
+        "published": len(published),
         "updated": sum(1 for r in results if r.get("updated")),
-        "skipped": sum(1 for r in results if r.get("skipped")),
+        "covers": sum(1 for r in cover_results if r.get("cover")),
+        "skipped": sum(1 for r in results if r.get("skipped"))
+        + sum(1 for r in cover_results if r.get("skipped")),
         "errors": errors,
         "telegram_og": sum(1 for r in results if r.get("telegram_og") and r.get("updated")),
         "results": results,
+        "cover_results": cover_results,
     }
 
 
@@ -961,6 +1247,39 @@ def _self_check() -> None:
     assert abs(_groq_retry_wait(fake_429) - 1.5) < 0.01
     fake_ms = httpx.Response(429, text="Please try again in 500ms")
     assert abs(_groq_retry_wait(fake_ms) - 0.5) < 0.01
+    prompt = build_cover_prompt("SSD tips", "How to choose a fast drive for laptops.")
+    assert "SSD tips" in prompt
+    assert "no text" in prompt.lower()
+    assert needs_cover({"feature_image": ""}) is True
+    assert needs_cover({"feature_image": "https://x/y.png"}) is False
+    assert _guess_image_meta(b"\x89PNG\r\n\x1a\nxxxx")[0] == "image/png"
+    assert _guess_image_meta(b"\xff\xd8\xff\xe0xxxx")[1] == "cover.jpg"
+    tiny_png_b64 = (
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
+    )
+    decoded = _image_bytes_from_generations_payload(
+        {"data": [{"b64_json": tiny_png_b64}]}
+    )
+    assert decoded.startswith(b"\x89PNG")
+    chat_decoded = _image_bytes_from_chat_payload(
+        {
+            "choices": [
+                {
+                    "message": {
+                        "content": [
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": f"data:image/png;base64,{tiny_png_b64}",
+                                },
+                            }
+                        ]
+                    }
+                }
+            ]
+        }
+    )
+    assert chat_decoded.startswith(b"\x89PNG")
     assert is_png_url("https://cdn.example/content/images/a.png")
     assert not is_png_url("https://cdn.example/content/images/a.jpg")
     assert is_jpeg_url("https://cdn.example/x-og.jpg")

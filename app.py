@@ -488,18 +488,19 @@ def build_cover_prompt(title: str, body: str) -> str:
     topic = re.sub(r"\s+", " ", (body or "").strip())[:_MAX_COVER_TOPIC_CHARS].strip()
     title_clean = re.sub(r"\s+", " ", (title or "Untitled").strip())
     parts = [
-        "Create a single editorial blog cover illustration.",
+        "Create a single editorial blog cover illustration for a link preview card.",
         f"Topic / subject: {title_clean}.",
     ]
     if topic:
         parts.append(f"Article context (for mood and motif only): {topic}")
     parts.append(
-        "Widescreen 16:9 composition, atmospheric, cohesive color palette, "
-        "suitable as a feature image for a tech/product blog."
+        "Widescreen 16:9 composition (~1200px wide), atmospheric, cohesive color palette, "
+        "strong focal subject readable as a small Telegram/social Open Graph thumbnail."
     )
     parts.append(
         "Strict rules: no text, letters, words, numbers, typography, watermarks, "
-        "logos, UI chrome, captions, or signatures anywhere in the image."
+        "logos, UI chrome, captions, or signatures anywhere in the image. "
+        "Prefer a clean photographic or illustration look that compresses well as JPEG."
     )
     return " ".join(parts)
 
@@ -596,9 +597,11 @@ def generate_cover_image(prompt: str) -> bytes:
         "model": BOTHUB_IMAGE_MODEL,
         "prompt": prompt,
         "n": 1,
+        # ~1200-wide OG-friendly frame; Telegram WebpageBot needs a real .jpg URL later.
         "size": "1792x1024",
         "response_format": "b64_json",
         "aspect_ratio": "16:9",
+        "output_format": "jpeg",
     }
     response = http_image.post(
         f"{BOTHUB_BASE_URL}/images/generations",
@@ -652,45 +655,6 @@ def upload_ghost_image(raw: bytes, filename: str | None = None) -> str:
     if not images or not images[0].get("url"):
         raise RuntimeError(f"Ghost image upload missing url: {response.text[:400]}")
     return str(images[0]["url"])
-
-
-def process_published_cover(post: dict[str, Any]) -> dict[str, Any]:
-    post_id = post["id"]
-    title = post.get("title") or "Untitled"
-    if not needs_cover(post):
-        return {"id": post_id, "title": title, "skipped": True, "reason": "cover already set"}
-
-    html_raw = post.get("html") or ""
-    body = html_to_text(html_raw)
-    if len(body) < 40 and len(title.strip()) < 3:
-        return {"id": post_id, "title": title, "skipped": True, "reason": "body too short"}
-
-    prompt = build_cover_prompt(title, body)
-    raw = generate_cover_image(prompt)
-    if len(raw) < 100:
-        raise RuntimeError("BotHub returned empty/too-small image")
-
-    slug = (post.get("slug") or post_id)[:60]
-    _, ext_name = _guess_image_meta(raw)
-    # Prefer .jpg when BotHub returns JPEG (Telegram-friendly); PNG stays .png
-    # and FIX_TELEGRAM_OG will re-upload a real .jpg for og/twitter.
-    ext = Path(ext_name).suffix or ".png"
-    url = upload_ghost_image(raw, filename=f"cover-{slug}{ext}")
-    fields = {
-        "feature_image": url,
-        "og_image": url,
-        "twitter_image": url,
-    }
-    saved = update_post(post_id, post["updated_at"], fields)
-    return {
-        "id": post_id,
-        "title": title,
-        "updated": True,
-        "cover": True,
-        "slug": saved.get("slug"),
-        "image_url": url,
-        "host": urlparse(url).netloc,
-    }
 
 
 def is_png_url(url: str | None) -> bool:
@@ -759,6 +723,93 @@ def upload_jpeg_image(jpeg_bytes: bytes, filename: str) -> str:
     return url
 
 
+def cover_bytes_as_telegram_jpeg(raw: bytes, slug: str) -> str:
+    """Store cover under a real ``.jpg`` URL (WebpageBot rejects JPEG bytes behind ``.png``)."""
+    safe_slug = (slug or "post").strip() or "post"
+    if raw[:2] == b"\xff\xd8":
+        return upload_jpeg_image(raw, f"{safe_slug}-cover.jpg")
+
+    # Stage PNG/WebP on Ghost, pull CDN /format/jpeg/ (same path as Telegram OG fix), re-upload.
+    _, src_name = _guess_image_meta(raw)
+    src_ext = Path(src_name).suffix or ".png"
+    staged = upload_ghost_image(raw, filename=f"{safe_slug}-cover-src{src_ext}")
+    transform = to_jpeg_transform_url(staged)
+    response = http.get(transform, headers={"User-Agent": "TelegramBot (like TwitterBot)"})
+    response.raise_for_status()
+    jpeg_bytes = response.content
+    if len(jpeg_bytes) < 100 or jpeg_bytes[:2] != b"\xff\xd8":
+        raise RuntimeError(f"cover transform is not JPEG: {transform}")
+    return upload_jpeg_image(jpeg_bytes, f"{safe_slug}-cover.jpg")
+
+
+def telegram_one_line_description_fields(post: dict[str, Any]) -> dict[str, Any]:
+    """Collapse multiline social descriptions (WebpageBot / ghost_head)."""
+    if not description_has_newlines(post):
+        return {}
+    desc = one_line(
+        post.get("og_description")
+        or post.get("meta_description")
+        or post.get("custom_excerpt")
+        or post.get("excerpt")
+        or post.get("title")
+    )
+    if not desc:
+        return {}
+    fields: dict[str, Any] = {
+        "og_description": desc,
+        "meta_description": desc,
+        "twitter_description": desc,
+    }
+    excerpt = post.get("custom_excerpt") or ""
+    if "\n" in excerpt or "\r" in excerpt:
+        fields["custom_excerpt"] = desc
+    return fields
+
+
+def process_published_cover(post: dict[str, Any]) -> dict[str, Any]:
+    """Generate BotHub cover and store Telegram/OG-safe ``.jpg`` feature + social images."""
+    post_id = post["id"]
+    title = post.get("title") or "Untitled"
+    if not needs_cover(post):
+        return {"id": post_id, "title": title, "skipped": True, "reason": "cover already set"}
+
+    html_raw = post.get("html") or ""
+    body = html_to_text(html_raw)
+    if len(body) < 40 and len(title.strip()) < 3:
+        return {"id": post_id, "title": title, "skipped": True, "reason": "body too short"}
+
+    prompt = build_cover_prompt(title, body)
+    raw = generate_cover_image(prompt)
+    if len(raw) < 100:
+        raise RuntimeError("BotHub returned empty/too-small image")
+
+    slug = (post.get("slug") or post_id)[:60]
+    url = cover_bytes_as_telegram_jpeg(raw, slug)
+    if not is_jpeg_url(url):
+        raise RuntimeError(f"cover upload is not a .jpg URL: {url!r}")
+
+    fields: dict[str, Any] = {
+        "feature_image": url,
+        "og_image": url,
+        "twitter_image": url,
+    }
+    fields.update(telegram_one_line_description_fields(post))
+    saved = update_post(post_id, post["updated_at"], fields)
+    result: dict[str, Any] = {
+        "id": post_id,
+        "title": title,
+        "updated": True,
+        "cover": True,
+        "telegram_og": True,
+        "slug": saved.get("slug"),
+        "image_url": url,
+        "host": urlparse(url).netloc,
+    }
+    if fields.get("og_description"):
+        result["desc_fixed"] = True
+    return result
+
+
 def build_telegram_og_fields(post: dict[str, Any], *, enabled: bool | None = None) -> dict[str, Any]:
     """Ensure .jpg og/twitter images and one-line social descriptions for Telegram."""
     if not needs_telegram_og_fix(post, enabled=enabled):
@@ -781,22 +832,9 @@ def build_telegram_og_fields(post: dict[str, Any], *, enabled: bool | None = Non
             fields["og_image"] = uploaded
             fields["twitter_image"] = uploaded
 
-    if description_has_newlines(post):
-        desc = one_line(
-            post.get("og_description")
-            or post.get("meta_description")
-            or post.get("custom_excerpt")
-            or post.get("excerpt")
-            or post.get("title")
-        )
-        if desc:
-            fields["og_description"] = desc
-            fields["meta_description"] = desc
-            fields["twitter_description"] = desc
-            # custom_excerpt feeds ghost_head when SEO fields empty — keep it one-line too
-            if post.get("custom_excerpt") and ("\n" in (post.get("custom_excerpt") or "") or "\r" in (post.get("custom_excerpt") or "")):
-                fields["custom_excerpt"] = desc
-            log.info("telegram desc %s → %s chars", post.get("slug"), len(desc))
+    fields.update(telegram_one_line_description_fields(post))
+    if fields.get("og_description"):
+        log.info("telegram desc %s → %s chars", post.get("slug"), len(fields["og_description"]))
 
     return fields
 
@@ -1292,6 +1330,10 @@ def _self_check() -> None:
     assert one_line("a\n\nb  c", 180) == "a b c"
     assert description_has_newlines({"custom_excerpt": "a\nb"}) is True
     assert description_has_newlines({"custom_excerpt": "ab"}) is False
+    assert telegram_one_line_description_fields({"custom_excerpt": "a\nb", "title": "T"})[
+        "custom_excerpt"
+    ] == "a b"
+    assert telegram_one_line_description_fields({"custom_excerpt": "ab"}) == {}
     log.info("self-check ok")
 
 

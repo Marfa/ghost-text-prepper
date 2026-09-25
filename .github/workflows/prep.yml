@@ -1,4 +1,4 @@
-name: Daily draft prep
+name: Daily scheduled prep
 
 on:
   schedule:
@@ -24,7 +24,7 @@ jobs:
 
       - run: python app.py --self-check
 
-      - name: Prep drafts
+      - name: Prep scheduled posts
         env:
           GHOST_URL: ${{ vars.GHOST_URL }}
           GHOST_ADMIN_API_KEY: ${{ secrets.GHOST_ADMIN_API_KEY }}

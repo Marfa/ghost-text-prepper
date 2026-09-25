@@ -1,6 +1,6 @@
-"""Prep Ghost draft posts: strip AI Unicode marks, then SEO/social excerpt.
+"""Prep Ghost scheduled posts: strip AI Unicode marks, then SEO/social excerpt.
 
-Also: cover image via BotHub when a draft is scheduled.
+Also: cover image via BotHub for scheduled posts without a feature image.
 """
 
 from __future__ import annotations
@@ -332,6 +332,8 @@ _STRIP_CPS = frozenset(
 )
 _EMOJI_GLUE = frozenset({0x200D, 0xFE0E, 0xFE0F})
 _DATA_AI_ATTR = re.compile(r"\sdata-ai[\w-]*\s*=\s*[\"'][^\"']*[\"']", re.I)
+_A_TAG = re.compile(r"(<a\b[^>]*>)(.*?)(</a>)", re.I | re.S)
+_U_TAG = re.compile(r"</?u\b[^>]*>", re.I)
 
 
 def _is_emoji_base(cp: int) -> bool:
@@ -368,10 +370,24 @@ def scrub_ai_marks(text: str) -> tuple[str, int]:
     return "".join(out), removed
 
 
+def unwrap_underline_in_links(raw_html: str) -> tuple[str, int]:
+    """Drop nested ``<u>`` inside ``<a>`` — theme CSS already underlines links."""
+    removed = 0
+
+    def _repl(match: re.Match[str]) -> str:
+        nonlocal removed
+        inner, n = _U_TAG.subn("", match.group(2))
+        removed += n
+        return f"{match.group(1)}{inner}{match.group(3)}"
+
+    return _A_TAG.sub(_repl, raw_html or ""), removed
+
+
 def scrub_post_html(raw_html: str) -> tuple[str, int]:
     cleaned, removed = scrub_ai_marks(raw_html or "")
     cleaned, n_attr = _DATA_AI_ATTR.subn("", cleaned)
-    return cleaned, removed + n_attr
+    cleaned, n_u = unwrap_underline_in_links(cleaned)
+    return cleaned, removed + n_attr + n_u
 
 
 def truncate_excerpt(text: str, limit: int = MAX_EXCERPT_LEN) -> str:
@@ -418,33 +434,8 @@ def _ghost(method: str, path: str, **kwargs: Any) -> dict[str, Any]:
     return response.json()
 
 
-def list_drafts(since: datetime) -> list[dict[str, Any]]:
-    since_iso = to_ghost_filter_date(since)
-    post_filter = f"status:draft+updated_at:>'{since_iso}'"
-    posts: list[dict[str, Any]] = []
-    page = 1
-    while True:
-        data = _ghost(
-            "GET",
-            "posts/",
-            params={
-                "filter": post_filter,
-                "formats": "html",
-                "order": "updated_at asc",
-                "limit": 50,
-                "page": page,
-            },
-        )
-        posts.extend(data["posts"])
-        pagination = data.get("meta", {}).get("pagination", {})
-        if page >= pagination.get("pages", 1):
-            break
-        page += 1
-    return posts
-
-
 def list_scheduled_since(since: datetime) -> list[dict[str, Any]]:
-    """Scheduled posts updated after ``since`` (draft → scheduled window).
+    """Scheduled posts updated after ``since`` (prep + cover window).
 
     Uses ``updated_at`` (not ``published_at``): on schedule, ``published_at`` is the
     future go-live time and would match every future post on every run.
@@ -940,12 +931,12 @@ def run_telegram_og_fix(
         log.info("telegram og skipped (FIX_TELEGRAM_OG=0)")
         return {"candidates": 0, "updated": 0, "errors": 0, "results": []}
     if all_png:
-        posts = list_posts("status:[draft,published]")
+        posts = list_posts("status:[scheduled,published]")
     elif recent_hours is not None:
         since_dt = datetime.now(timezone.utc).timestamp() - recent_hours * 3600
         since = datetime.fromtimestamp(since_dt, tz=timezone.utc)
         since_iso = to_ghost_filter_date(since)
-        posts = list_posts(f"status:[draft,published]+updated_at:>'{since_iso}'")
+        posts = list_posts(f"status:[scheduled,published]+updated_at:>'{since_iso}'")
     else:
         if since is None:
             raise RuntimeError("since required unless all_png/recent_hours")
@@ -1159,27 +1150,27 @@ def run() -> dict[str, Any]:
     run_started_at = datetime.now(timezone.utc)
     last_run_at = read_last_run()
     if last_run_at is None:
-        log.info("first run — no state yet, baseline only (no drafts/covers processed)")
+        log.info("first run — no state yet, baseline only (no scheduled posts processed)")
         write_last_run(run_started_at)
         return {
             "since": None,
             "first_run": True,
-            "drafts": 0,
             "scheduled": 0,
             "updated": 0,
             "covers": 0,
             "skipped": 0,
             "errors": 0,
+            "telegram_og": 0,
             "results": [],
             "cover_results": [],
         }
 
     since_iso = to_ghost_filter_date(last_run_at)
-    log.info("collecting drafts updated after %s", since_iso)
-    drafts = list_drafts(last_run_at)
-    log.info("found %s draft(s) in window", len(drafts))
+    log.info("collecting scheduled posts updated after %s", since_iso)
+    scheduled = list_scheduled_since(last_run_at)
+    log.info("found %s scheduled post(s) in window", len(scheduled))
     results: list[dict[str, Any]] = []
-    for i, post in enumerate(drafts):
+    for i, post in enumerate(scheduled):
         try:
             result = process_post(post)
             results.append(result)
@@ -1187,17 +1178,17 @@ def run() -> dict[str, Any]:
         except Exception as exc:
             log.exception("post %s failed", post.get("id"))
             results.append({"id": post.get("id"), "title": post.get("title"), "error": str(exc)})
-        if i + 1 < len(drafts):
+        if i + 1 < len(scheduled):
             # Free Groq is ~30 RPM; 2.5s when on HF-skip/Groq path stays under the limit.
             time.sleep(2.5 if _hf_skip_run else 1)
 
     cover_results: list[dict[str, Any]] = []
-    scheduled: list[dict[str, Any]] = []
     if BOTHUB_API_KEY:
-        log.info("collecting scheduled posts after %s for covers", since_iso)
-        scheduled = list_scheduled_since(last_run_at)
-        log.info("found %s scheduled post(s) in window", len(scheduled))
-        for i, post in enumerate(scheduled):
+        # Re-fetch: prep may have bumped updated_at (Ghost rejects stale PUT).
+        log.info("re-collecting scheduled posts after %s for covers", since_iso)
+        scheduled_for_covers = list_scheduled_since(last_run_at)
+        log.info("found %s scheduled post(s) for covers", len(scheduled_for_covers))
+        for i, post in enumerate(scheduled_for_covers):
             try:
                 result = process_scheduled_cover(post)
                 cover_results.append(result)
@@ -1207,13 +1198,13 @@ def run() -> dict[str, Any]:
                 cover_results.append(
                     {"id": post.get("id"), "title": post.get("title"), "error": str(exc)}
                 )
-            if i + 1 < len(scheduled):
+            if i + 1 < len(scheduled_for_covers):
                 time.sleep(1.5)
     else:
         log.info("BOTHUB_API_KEY unset — skipping scheduled cover generation")
 
     if FIX_TELEGRAM_OG:
-        # Published posts updated in the same window (covers set after draft prep).
+        # Published posts updated in the same window (covers set after scheduled prep).
         pub = run_telegram_og_fix(since=last_run_at)
         results.extend(pub["results"])
         log.info(
@@ -1234,7 +1225,6 @@ def run() -> dict[str, Any]:
     return {
         "since": since_iso,
         "first_run": False,
-        "drafts": len(drafts),
         "scheduled": len(scheduled),
         "updated": sum(1 for r in results if r.get("updated")),
         "covers": sum(1 for r in cover_results if r.get("cover")),
@@ -1262,6 +1252,16 @@ def _self_check() -> None:
     assert scrub_ai_marks(family) == (family, 0)
     html_out, n = scrub_post_html('<p data-ai-generated="yes">Hi\u200b</p>')
     assert n == 2 and "data-ai" not in html_out and "\u200b" not in html_out
+    linked, n_u = unwrap_underline_in_links(
+        'можно<a href="https://x.test"> <u>посмотреть</u></a>.'
+    )
+    assert n_u == 2 and "<u>" not in linked and "посмотреть" in linked
+    keep_u, n_keep = unwrap_underline_in_links("<p><u>не ссылка</u></p>")
+    assert n_keep == 0 and "<u>не ссылка</u>" in keep_u
+    scrubbed_u, n_scrub = scrub_post_html(
+        '<p>x<a href="https://x.test"><u>y</u></a></p>'
+    )
+    assert n_scrub >= 2 and "<u>" not in scrubbed_u
     sample_tags = [
         {"name": "Actiondesk", "slug": "actiondesk", "count": {"posts": 1}},
         {
@@ -1348,12 +1348,12 @@ if __name__ == "__main__":
     import argparse
     import sys
 
-    parser = argparse.ArgumentParser(description="Ghost draft prep and tag rotation")
+    parser = argparse.ArgumentParser(description="Ghost scheduled-post prep and tag rotation")
     parser.add_argument("--self-check", action="store_true", help="run helper self-check only")
     parser.add_argument(
         "--fix-telegram-og",
         action="store_true",
-        help="re-upload PNG covers as real .jpg og_image/twitter_image (all drafts+published)",
+        help="re-upload PNG covers as real .jpg og_image/twitter_image (all scheduled+published)",
     )
     parser.add_argument(
         "--fix-telegram-og-recent",
@@ -1421,8 +1421,7 @@ if __name__ == "__main__":
     _self_check()
     summary = run()
     log.info(
-        "done: drafts=%s scheduled=%s updated=%s covers=%s skipped=%s errors=%s",
-        summary["drafts"],
+        "done: scheduled=%s updated=%s covers=%s skipped=%s errors=%s",
         summary.get("scheduled", 0),
         summary["updated"],
         summary.get("covers", 0),

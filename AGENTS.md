@@ -1,6 +1,6 @@
 # Ghost Text Prepper — agent notes
 
-Daily prep of Ghost draft posts: short SEO/social excerpt via Hugging Face.
+Daily prep of Ghost scheduled posts: short SEO/social excerpt via Hugging Face.
 
 Follow [ponytail](https://github.com/DietrichGebert/ponytail):
 

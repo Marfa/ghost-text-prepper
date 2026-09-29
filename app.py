@@ -708,16 +708,24 @@ def description_has_newlines(post: dict[str, Any]) -> bool:
     return False
 
 
+def social_description_blank(post: dict[str, Any]) -> bool:
+    """Empty SEO → ghost_head emits multiline HTML excerpt; WebpageBot often drops the card."""
+    return not any(
+        str(post.get(k) or "").strip()
+        for k in ("og_description", "meta_description", "twitter_description", "custom_excerpt")
+    )
+
+
 def needs_telegram_og_fix(post: dict[str, Any], *, enabled: bool | None = None) -> bool:
     if enabled is None:
         enabled = FIX_TELEGRAM_OG
     if not enabled:
         return False
-    og = post.get("og_image") or ""
-    if is_jpeg_url(og) and not description_has_newlines(post):
-        return False
-    if description_has_newlines(post):
+    if description_has_newlines(post) or social_description_blank(post):
         return True
+    og = post.get("og_image") or ""
+    if is_jpeg_url(og):
+        return False
     source = og or (post.get("feature_image") or "")
     return is_png_url(source)
 
@@ -762,8 +770,8 @@ def cover_bytes_as_telegram_jpeg(raw: bytes, slug: str) -> str:
 
 
 def telegram_one_line_description_fields(post: dict[str, Any]) -> dict[str, Any]:
-    """Collapse multiline social descriptions (WebpageBot / ghost_head)."""
-    if not description_has_newlines(post):
+    """Fill/collapse social descriptions so ghost_head does not emit multiline HTML excerpt."""
+    if not description_has_newlines(post) and not social_description_blank(post):
         return {}
     desc = one_line(
         post.get("og_description")
@@ -780,7 +788,7 @@ def telegram_one_line_description_fields(post: dict[str, Any]) -> dict[str, Any]
         "twitter_description": desc,
     }
     excerpt = post.get("custom_excerpt") or ""
-    if "\n" in excerpt or "\r" in excerpt:
+    if not excerpt.strip() or "\n" in excerpt or "\r" in excerpt:
         fields["custom_excerpt"] = desc
     return fields
 

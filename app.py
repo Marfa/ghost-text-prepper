@@ -43,6 +43,9 @@ BOTHUB_API_KEY = _env("BOTHUB_API_KEY")
 BOTHUB_BASE_URL = _env("BOTHUB_BASE_URL", "https://bothub.chat/api/v2/openai/v1").rstrip("/")
 # Nano Banana 2 on BotHub == Google gemini-3.1-flash-image
 BOTHUB_IMAGE_MODEL = _env("BOTHUB_IMAGE_MODEL", "gemini-3.1-flash-image")
+# OG/Telegram thumbs need ~1200px wide; 1792x1024 reserves far more CAPS than Eco balance often has.
+BOTHUB_IMAGE_SIZE = _env("BOTHUB_IMAGE_SIZE", "1280x720")
+_BOTHUB_IMAGE_SIZE_FALLBACKS = ("1024x576", "1024x1024")
 
 MAX_EXCERPT_LEN = int(_env("MAX_EXCERPT_LEN", "146"))
 SKIP_COMPLETE = _env("SKIP_COMPLETE", "1") not in ("0", "false", "False")
@@ -60,6 +63,7 @@ _DATA_URL_RE = re.compile(
     r"data:(image/(?:png|jpeg|jpg|webp));base64,([A-Za-z0-9+/=\s]+)",
     re.I,
 )
+_BOTHUB_CAPS_RE = re.compile(r"NOT_ENOUGH_TOKENS|Недостаточно CAPS", re.I)
 
 http = httpx.Client(timeout=httpx.Timeout(30.0, read=180.0))
 # Image models can take longer than excerpt chat.
@@ -580,6 +584,10 @@ def _image_bytes_from_chat_payload(data: dict[str, Any]) -> bytes:
     raise RuntimeError(f"BotHub chat completion had no image: {str(data)[:500]}")
 
 
+def _is_bothub_insufficient_caps(status_code: int, body: str) -> bool:
+    return status_code == 403 and bool(_BOTHUB_CAPS_RE.search(body or ""))
+
+
 def generate_cover_image(prompt: str) -> bytes:
     """Generate cover bytes via BotHub (OpenAI-compatible images, chat fallback)."""
     if not BOTHUB_API_KEY:
@@ -588,26 +596,46 @@ def generate_cover_image(prompt: str) -> bytes:
         "Authorization": f"Bearer {BOTHUB_API_KEY}",
         "Content-Type": "application/json",
     }
-    # JPEG for Telegram is done after upload (Ghost /format/jpeg/); do not send
-    # output_format — BotHub may reject it as temporarily unavailable for the model.
-    gen_body: dict[str, Any] = {
-        "model": BOTHUB_IMAGE_MODEL,
-        "prompt": prompt,
-        "n": 1,
-        # ~1200-wide OG-friendly frame; Telegram WebpageBot needs a real .jpg URL later.
-        "size": "1792x1024",
-        "response_format": "b64_json",
-        "aspect_ratio": "16:9",
-    }
-    response = http_image.post(
-        f"{BOTHUB_BASE_URL}/images/generations",
-        headers=headers,
-        json=gen_body,
-    )
-    if response.is_success:
-        return _image_bytes_from_generations_payload(response.json())
+    sizes: list[str] = []
+    for candidate in (BOTHUB_IMAGE_SIZE, *_BOTHUB_IMAGE_SIZE_FALLBACKS):
+        if candidate and candidate not in sizes:
+            sizes.append(candidate)
 
-    err_snip = response.text[:400]
+    response: httpx.Response | None = None
+    err_snip = ""
+    for size in sizes:
+        # JPEG for Telegram is done after upload (Ghost /format/jpeg/); do not send
+        # output_format — BotHub may reject it as temporarily unavailable for the model.
+        gen_body: dict[str, Any] = {
+            "model": BOTHUB_IMAGE_MODEL,
+            "prompt": prompt,
+            "n": 1,
+            # ~1200-wide OG-friendly frame; Telegram WebpageBot needs a real .jpg URL later.
+            "size": size,
+            "response_format": "b64_json",
+            "aspect_ratio": "16:9",
+        }
+        response = http_image.post(
+            f"{BOTHUB_BASE_URL}/images/generations",
+            headers=headers,
+            json=gen_body,
+        )
+        if response.is_success:
+            if size != BOTHUB_IMAGE_SIZE:
+                log.info("BotHub cover ok with fallback size %s", size)
+            return _image_bytes_from_generations_payload(response.json())
+
+        err_snip = response.text[:400]
+        if _is_bothub_insufficient_caps(response.status_code, err_snip):
+            log.warning(
+                "BotHub images/generations size=%s → CAPS short (%s) — trying smaller size",
+                size,
+                err_snip,
+            )
+            continue
+        break
+
+    assert response is not None
     # Retry with a minimal OpenAI-shaped body if optional fields are rejected.
     if response.status_code == 400 and any(
         key in err_snip.lower()
@@ -633,6 +661,13 @@ def generate_cover_image(prompt: str) -> bytes:
             return _image_bytes_from_generations_payload(response.json())
         err_snip = response.text[:400]
 
+    if _is_bothub_insufficient_caps(response.status_code, err_snip):
+        raise RuntimeError(
+            "BotHub CAPS insufficient for cover generation "
+            f"(tried sizes {', '.join(sizes)}). Top up balance or lower BOTHUB_IMAGE_SIZE. "
+            f"API: {err_snip}"
+        )
+
     if response.status_code not in (404, 405):
         log.error("BotHub images/generations → %s %s", response.status_code, err_snip)
         response.raise_for_status()
@@ -650,6 +685,11 @@ def generate_cover_image(prompt: str) -> bytes:
     )
     if chat.is_error:
         log.error("BotHub chat.completions → %s %s", chat.status_code, chat.text[:500])
+        if _is_bothub_insufficient_caps(chat.status_code, chat.text):
+            raise RuntimeError(
+                "BotHub CAPS insufficient for cover generation (chat fallback). "
+                f"Top up balance. API: {chat.text[:400]}"
+            )
     chat.raise_for_status()
     return _image_bytes_from_chat_payload(chat.json())
 
@@ -1230,6 +1270,23 @@ def run() -> dict[str, Any]:
                 cover_results.append(
                     {"id": post.get("id"), "title": post.get("title"), "error": str(exc)}
                 )
+                # Further covers will fail the same way; stop to avoid burning the run.
+                if "CAPS insufficient" in str(exc):
+                    remaining = len(scheduled_for_covers) - i - 1
+                    if remaining:
+                        log.warning(
+                            "stopping cover generation — BotHub CAPS insufficient (%s left)",
+                            remaining,
+                        )
+                        for left in scheduled_for_covers[i + 1 :]:
+                            cover_results.append(
+                                {
+                                    "id": left.get("id"),
+                                    "title": left.get("title"),
+                                    "error": "skipped: BotHub CAPS insufficient",
+                                }
+                            )
+                    break
             if i + 1 < len(scheduled_for_covers):
                 time.sleep(1.5)
     else:
@@ -1329,6 +1386,12 @@ def _self_check() -> None:
     assert "no text" in prompt.lower()
     assert needs_cover({"feature_image": ""}) is True
     assert needs_cover({"feature_image": "https://x/y.png"}) is False
+    assert _is_bothub_insufficient_caps(
+        403, '{"error":{"code":"NOT_ENOUGH_TOKENS","message":"Недостаточно CAPS"}}'
+    )
+    assert not _is_bothub_insufficient_caps(403, '{"error":{"code":"OTHER"}}')
+    assert not _is_bothub_insufficient_caps(500, "NOT_ENOUGH_TOKENS")
+    assert BOTHUB_IMAGE_SIZE
     assert _guess_image_meta(b"\x89PNG\r\n\x1a\nxxxx")[0] == "image/png"
     assert _guess_image_meta(b"\xff\xd8\xff\xe0xxxx")[1] == "cover.jpg"
     tiny_png_b64 = (

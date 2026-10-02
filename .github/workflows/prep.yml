@@ -34,6 +34,7 @@ jobs:
           GROQ_TEXT_MODEL: ${{ vars.GROQ_TEXT_MODEL }}
           BOTHUB_API_KEY: ${{ secrets.BOTHUB_API_KEY }}
           BOTHUB_IMAGE_MODEL: ${{ vars.BOTHUB_IMAGE_MODEL }}
+          BOTHUB_IMAGE_SIZE: ${{ vars.BOTHUB_IMAGE_SIZE }}
           MAX_EXCERPT_LEN: "146"
           SKIP_COMPLETE: "1"
           SKIP_COVER_COMPLETE: "1"

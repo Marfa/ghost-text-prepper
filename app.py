@@ -43,9 +43,10 @@ BOTHUB_API_KEY = _env("BOTHUB_API_KEY")
 BOTHUB_BASE_URL = _env("BOTHUB_BASE_URL", "https://bothub.chat/api/v2/openai/v1").rstrip("/")
 # Nano Banana 2 on BotHub == Google gemini-3.1-flash-image
 BOTHUB_IMAGE_MODEL = _env("BOTHUB_IMAGE_MODEL", "gemini-3.1-flash-image")
-# OG/Telegram thumbs need ~1200px wide; 1792x1024 reserves far more CAPS than Eco balance often has.
-BOTHUB_IMAGE_SIZE = _env("BOTHUB_IMAGE_SIZE", "1280x720")
-_BOTHUB_IMAGE_SIZE_FALLBACKS = ("1024x576", "1024x1024")
+# OG/Telegram thumbs need ~1200px; BotHub Eco often rejects widescreen with NOT_ENOUGH_TOKENS
+# (same ~375k CAPS reserve for 1280x720 / 1024x576) while 1024x1024 succeeds (~67k).
+BOTHUB_IMAGE_SIZE = _env("BOTHUB_IMAGE_SIZE", "1024x1024")
+_BOTHUB_IMAGE_SIZE_FALLBACKS = ("1280x720", "1024x576")
 
 MAX_EXCERPT_LEN = int(_env("MAX_EXCERPT_LEN", "146"))
 SKIP_COMPLETE = _env("SKIP_COMPLETE", "1") not in ("0", "false", "False")

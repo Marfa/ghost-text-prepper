@@ -43,10 +43,8 @@ BOTHUB_API_KEY = _env("BOTHUB_API_KEY")
 BOTHUB_BASE_URL = _env("BOTHUB_BASE_URL", "https://bothub.chat/api/v2/openai/v1").rstrip("/")
 # Nano Banana 2 on BotHub == Google gemini-3.1-flash-image
 BOTHUB_IMAGE_MODEL = _env("BOTHUB_IMAGE_MODEL", "gemini-3.1-flash-image")
-# OG/Telegram thumbs need ~1200px; BotHub Eco often rejects widescreen with NOT_ENOUGH_TOKENS
-# (same ~375k CAPS reserve for 1280x720 / 1024x576) while 1024x1024 succeeds (~67k).
+# Square only — widescreen sizes reserve ~375k CAPS on Eco; 1024x1024 is ~67k.
 BOTHUB_IMAGE_SIZE = _env("BOTHUB_IMAGE_SIZE", "1024x1024")
-_BOTHUB_IMAGE_SIZE_FALLBACKS = ("1280x720", "1024x576")
 
 MAX_EXCERPT_LEN = int(_env("MAX_EXCERPT_LEN", "146"))
 SKIP_COMPLETE = _env("SKIP_COMPLETE", "1") not in ("0", "false", "False")
@@ -494,7 +492,7 @@ def build_cover_prompt(title: str, body: str) -> str:
     if topic:
         parts.append(f"Article context (for mood and motif only): {topic}")
     parts.append(
-        "Widescreen 16:9 composition (~1200px wide), atmospheric, cohesive color palette, "
+        "Square 1:1 composition (1024x1024), atmospheric, cohesive color palette, "
         "strong focal subject readable as a small Telegram/social Open Graph thumbnail."
     )
     parts.append(
@@ -590,53 +588,32 @@ def _is_bothub_insufficient_caps(status_code: int, body: str) -> bool:
 
 
 def generate_cover_image(prompt: str) -> bytes:
-    """Generate cover bytes via BotHub (OpenAI-compatible images, chat fallback)."""
+    """Generate one 1024x1024 cover via BotHub (OpenAI-compatible images, chat fallback)."""
     if not BOTHUB_API_KEY:
         raise RuntimeError("Missing BOTHUB_API_KEY")
     headers = {
         "Authorization": f"Bearer {BOTHUB_API_KEY}",
         "Content-Type": "application/json",
     }
-    sizes: list[str] = []
-    for candidate in (BOTHUB_IMAGE_SIZE, *_BOTHUB_IMAGE_SIZE_FALLBACKS):
-        if candidate and candidate not in sizes:
-            sizes.append(candidate)
+    # JPEG for Telegram is done after upload (Ghost /format/jpeg/); do not send
+    # output_format — BotHub may reject it as temporarily unavailable for the model.
+    gen_body: dict[str, Any] = {
+        "model": BOTHUB_IMAGE_MODEL,
+        "prompt": prompt,
+        "n": 1,
+        "size": BOTHUB_IMAGE_SIZE,
+        "response_format": "b64_json",
+        "aspect_ratio": "1:1",
+    }
+    response = http_image.post(
+        f"{BOTHUB_BASE_URL}/images/generations",
+        headers=headers,
+        json=gen_body,
+    )
+    if response.is_success:
+        return _image_bytes_from_generations_payload(response.json())
 
-    response: httpx.Response | None = None
-    err_snip = ""
-    for size in sizes:
-        # JPEG for Telegram is done after upload (Ghost /format/jpeg/); do not send
-        # output_format — BotHub may reject it as temporarily unavailable for the model.
-        gen_body: dict[str, Any] = {
-            "model": BOTHUB_IMAGE_MODEL,
-            "prompt": prompt,
-            "n": 1,
-            # ~1200-wide OG-friendly frame; Telegram WebpageBot needs a real .jpg URL later.
-            "size": size,
-            "response_format": "b64_json",
-            "aspect_ratio": "16:9",
-        }
-        response = http_image.post(
-            f"{BOTHUB_BASE_URL}/images/generations",
-            headers=headers,
-            json=gen_body,
-        )
-        if response.is_success:
-            if size != BOTHUB_IMAGE_SIZE:
-                log.info("BotHub cover ok with fallback size %s", size)
-            return _image_bytes_from_generations_payload(response.json())
-
-        err_snip = response.text[:400]
-        if _is_bothub_insufficient_caps(response.status_code, err_snip):
-            log.warning(
-                "BotHub images/generations size=%s → CAPS short (%s) — trying smaller size",
-                size,
-                err_snip,
-            )
-            continue
-        break
-
-    assert response is not None
+    err_snip = response.text[:400]
     # Retry with a minimal OpenAI-shaped body if optional fields are rejected.
     if response.status_code == 400 and any(
         key in err_snip.lower()
@@ -651,6 +628,7 @@ def generate_cover_image(prompt: str) -> bytes:
             "model": BOTHUB_IMAGE_MODEL,
             "prompt": prompt,
             "n": 1,
+            "size": BOTHUB_IMAGE_SIZE,
             "response_format": "b64_json",
         }
         response = http_image.post(
@@ -664,9 +642,8 @@ def generate_cover_image(prompt: str) -> bytes:
 
     if _is_bothub_insufficient_caps(response.status_code, err_snip):
         raise RuntimeError(
-            "BotHub CAPS insufficient for cover generation "
-            f"(tried sizes {', '.join(sizes)}). Top up balance or lower BOTHUB_IMAGE_SIZE. "
-            f"API: {err_snip}"
+            f"BotHub CAPS insufficient for cover {BOTHUB_IMAGE_SIZE}. "
+            f"Top up balance. API: {err_snip}"
         )
 
     if response.status_code not in (404, 405):

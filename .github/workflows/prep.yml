@@ -35,6 +35,7 @@ jobs:
           BOTHUB_API_KEY: ${{ secrets.BOTHUB_API_KEY }}
           BOTHUB_IMAGE_MODEL: ${{ vars.BOTHUB_IMAGE_MODEL }}
           BOTHUB_IMAGE_SIZE: ${{ vars.BOTHUB_IMAGE_SIZE }}
+          BOTHUB_GEN_SIZE: ${{ vars.BOTHUB_GEN_SIZE }}
           MAX_EXCERPT_LEN: "146"
           SKIP_COMPLETE: "1"
           SKIP_COVER_COMPLETE: "1"

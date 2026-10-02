@@ -15,6 +15,7 @@ import time
 import unicodedata
 from datetime import datetime, timezone
 from html.parser import HTMLParser
+from io import BytesIO
 from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import urlparse
@@ -23,6 +24,7 @@ import httpx
 import jwt
 from dotenv import load_dotenv
 from huggingface_hub import InferenceClient
+from PIL import Image
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(message)s")
@@ -43,8 +45,10 @@ BOTHUB_API_KEY = _env("BOTHUB_API_KEY")
 BOTHUB_BASE_URL = _env("BOTHUB_BASE_URL", "https://bothub.chat/api/v2/openai/v1").rstrip("/")
 # Nano Banana 2 on BotHub == Google gemini-3.1-flash-image
 BOTHUB_IMAGE_MODEL = _env("BOTHUB_IMAGE_MODEL", "gemini-3.1-flash-image")
-# Square only — widescreen sizes reserve ~375k CAPS on Eco; 1024x1024 is ~67k.
-BOTHUB_IMAGE_SIZE = _env("BOTHUB_IMAGE_SIZE", "1024x1024")
+# Final cover size after crop. Widescreen from BotHub reserves ~375k CAPS — generate square instead.
+BOTHUB_IMAGE_SIZE = _env("BOTHUB_IMAGE_SIZE", "1024x576")
+# BotHub request size (Eco-friendly). Keep square so CAPS reserve stays ~67k.
+BOTHUB_GEN_SIZE = _env("BOTHUB_GEN_SIZE", "1024x1024")
 
 MAX_EXCERPT_LEN = int(_env("MAX_EXCERPT_LEN", "146"))
 SKIP_COMPLETE = _env("SKIP_COMPLETE", "1") not in ("0", "false", "False")
@@ -55,6 +59,7 @@ STATE_FILE = Path(_env("STATE_FILE", "state/last-run.json"))
 TAG_STATE_FILE = Path(_env("TAG_STATE_FILE", "state/current-tag.json"))
 _PNG_URL_RE = re.compile(r"\.png(?:\?|$)", re.I)
 _JPEG_URL_RE = re.compile(r"\.jpe?g(?:\?|$)", re.I)
+_SIZE_RE = re.compile(r"^(\d+)x(\d+)$", re.I)
 
 _MAX_ARTICLE_CHARS = 6000
 _MAX_COVER_TOPIC_CHARS = 800
@@ -481,10 +486,45 @@ def needs_cover(post: dict[str, Any]) -> bool:
     return not bool((post.get("feature_image") or "").strip())
 
 
+def parse_image_size(size: str) -> tuple[int, int]:
+    match = _SIZE_RE.match((size or "").strip())
+    if not match:
+        raise ValueError(f"invalid image size {size!r}, expected WIDTHxHEIGHT")
+    width, height = int(match.group(1)), int(match.group(2))
+    if width < 1 or height < 1:
+        raise ValueError(f"invalid image size {size!r}")
+    return width, height
+
+
+def crop_cover_to_size(raw: bytes, size: str) -> bytes:
+    """Center-crop ``raw`` to ``size`` (WxH); return JPEG bytes."""
+    target_w, target_h = parse_image_size(size)
+    with Image.open(BytesIO(raw)) as img:
+        img = img.convert("RGB")
+        src_w, src_h = img.size
+        target_ratio = target_w / target_h
+        src_ratio = src_w / src_h
+        if src_ratio > target_ratio:
+            # Too wide — crop left/right.
+            new_w = max(1, int(round(src_h * target_ratio)))
+            left = max(0, (src_w - new_w) // 2)
+            box = (left, 0, left + new_w, src_h)
+        else:
+            # Too tall — crop top/bottom.
+            new_h = max(1, int(round(src_w / target_ratio)))
+            top = max(0, (src_h - new_h) // 2)
+            box = (0, top, src_w, top + new_h)
+        cropped = img.crop(box).resize((target_w, target_h), Image.Resampling.LANCZOS)
+        out = BytesIO()
+        cropped.save(out, format="JPEG", quality=90, optimize=True)
+        return out.getvalue()
+
+
 def build_cover_prompt(title: str, body: str) -> str:
     """Visual cover prompt from post topic; forbids glyphs/text in the image."""
     topic = re.sub(r"\s+", " ", (body or "").strip())[:_MAX_COVER_TOPIC_CHARS].strip()
     title_clean = re.sub(r"\s+", " ", (title or "Untitled").strip())
+    out_w, out_h = parse_image_size(BOTHUB_IMAGE_SIZE)
     parts = [
         "Create a single editorial blog cover illustration for a link preview card.",
         f"Topic / subject: {title_clean}.",
@@ -492,8 +532,9 @@ def build_cover_prompt(title: str, body: str) -> str:
     if topic:
         parts.append(f"Article context (for mood and motif only): {topic}")
     parts.append(
-        "Square 1:1 composition (1024x1024), atmospheric, cohesive color palette, "
-        "strong focal subject readable as a small Telegram/social Open Graph thumbnail."
+        f"Compose for a final {out_w}x{out_h} ({out_w}:{out_h}) frame: keep the focal subject "
+        "in the horizontal center band — top and bottom of a square canvas will be cropped away. "
+        "Atmospheric, cohesive color palette, readable as a small Telegram/social Open Graph thumbnail."
     )
     parts.append(
         "Strict rules: no text, letters, words, numbers, typography, watermarks, "
@@ -588,7 +629,10 @@ def _is_bothub_insufficient_caps(status_code: int, body: str) -> bool:
 
 
 def generate_cover_image(prompt: str) -> bytes:
-    """Generate one 1024x1024 cover via BotHub (OpenAI-compatible images, chat fallback)."""
+    """Generate cover via BotHub at BOTHUB_GEN_SIZE, then crop to BOTHUB_IMAGE_SIZE.
+
+    Widescreen BotHub sizes reserve ~375k CAPS; square gen (~67k) + local crop avoids that.
+    """
     if not BOTHUB_API_KEY:
         raise RuntimeError("Missing BOTHUB_API_KEY")
     headers = {
@@ -601,7 +645,7 @@ def generate_cover_image(prompt: str) -> bytes:
         "model": BOTHUB_IMAGE_MODEL,
         "prompt": prompt,
         "n": 1,
-        "size": BOTHUB_IMAGE_SIZE,
+        "size": BOTHUB_GEN_SIZE,
         "response_format": "b64_json",
         "aspect_ratio": "1:1",
     }
@@ -611,7 +655,8 @@ def generate_cover_image(prompt: str) -> bytes:
         json=gen_body,
     )
     if response.is_success:
-        return _image_bytes_from_generations_payload(response.json())
+        raw = _image_bytes_from_generations_payload(response.json())
+        return crop_cover_to_size(raw, BOTHUB_IMAGE_SIZE)
 
     err_snip = response.text[:400]
     # Retry with a minimal OpenAI-shaped body if optional fields are rejected.
@@ -628,7 +673,7 @@ def generate_cover_image(prompt: str) -> bytes:
             "model": BOTHUB_IMAGE_MODEL,
             "prompt": prompt,
             "n": 1,
-            "size": BOTHUB_IMAGE_SIZE,
+            "size": BOTHUB_GEN_SIZE,
             "response_format": "b64_json",
         }
         response = http_image.post(
@@ -637,12 +682,13 @@ def generate_cover_image(prompt: str) -> bytes:
             json=minimal,
         )
         if response.is_success:
-            return _image_bytes_from_generations_payload(response.json())
+            raw = _image_bytes_from_generations_payload(response.json())
+            return crop_cover_to_size(raw, BOTHUB_IMAGE_SIZE)
         err_snip = response.text[:400]
 
     if _is_bothub_insufficient_caps(response.status_code, err_snip):
         raise RuntimeError(
-            f"BotHub CAPS insufficient for cover {BOTHUB_IMAGE_SIZE}. "
+            f"BotHub CAPS insufficient for cover gen {BOTHUB_GEN_SIZE}. "
             f"Top up balance. API: {err_snip}"
         )
 
@@ -669,7 +715,7 @@ def generate_cover_image(prompt: str) -> bytes:
                 f"Top up balance. API: {chat.text[:400]}"
             )
     chat.raise_for_status()
-    return _image_bytes_from_chat_payload(chat.json())
+    return crop_cover_to_size(_image_bytes_from_chat_payload(chat.json()), BOTHUB_IMAGE_SIZE)
 
 
 def upload_ghost_image(raw: bytes, filename: str | None = None) -> str:
@@ -1370,6 +1416,16 @@ def _self_check() -> None:
     assert not _is_bothub_insufficient_caps(403, '{"error":{"code":"OTHER"}}')
     assert not _is_bothub_insufficient_caps(500, "NOT_ENOUGH_TOKENS")
     assert BOTHUB_IMAGE_SIZE
+    assert BOTHUB_GEN_SIZE
+    assert parse_image_size("1024x576") == (1024, 576)
+    # 2x2 red PNG → crop/resize to 1024x576 JPEG
+    tiny_rgb = Image.new("RGB", (64, 64), color=(200, 40, 40))
+    buf = BytesIO()
+    tiny_rgb.save(buf, format="PNG")
+    cropped = crop_cover_to_size(buf.getvalue(), "1024x576")
+    assert cropped[:2] == b"\xff\xd8"
+    with Image.open(BytesIO(cropped)) as check:
+        assert check.size == (1024, 576)
     assert _guess_image_meta(b"\x89PNG\r\n\x1a\nxxxx")[0] == "image/png"
     assert _guess_image_meta(b"\xff\xd8\xff\xe0xxxx")[1] == "cover.jpg"
     tiny_png_b64 = (

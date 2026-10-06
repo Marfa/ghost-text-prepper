@@ -78,7 +78,7 @@ Cron **каждые 30 минут**: workflow **Telegram OG fix (frequent)**.
 
 GitHub Actions: cron `0 6 * * *` UTC + `workflow_dispatch`.
 
-Secrets: `GHOST_ADMIN_API_KEY`, `HF_TOKEN`, `GROQ_API_KEY` (fallback), `BOTHUB_API_KEY` (обложки). Variables: `GHOST_URL`, `HF_TEXT_MODEL`, `BOTHUB_IMAGE_MODEL`, `BOTHUB_IMAGE_MODEL_FALLBACK` (публичный URL сайта — не секрет, иначе Job Summary маскирует ссылки).
+Secrets: `GHOST_ADMIN_API_KEY`, `HF_TOKEN`, `GROQ_API_KEY` (fallback), `BOTHUB_API_KEY` (обложки). Variables: `GHOST_URL`, `HF_TEXT_MODEL`, `BOTHUB_IMAGE_MODEL`, `BOTHUB_IMAGE_MODEL_FALLBACK`, `BOTHUB_IMAGE_SIZE`, `BOTHUB_GEN_SIZE` (публичный URL сайта — не секрет, иначе Job Summary маскирует ссылки).
 
 ## Лицензия
 

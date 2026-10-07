@@ -45,8 +45,6 @@ BOTHUB_API_KEY = _env("BOTHUB_API_KEY")
 BOTHUB_BASE_URL = _env("BOTHUB_BASE_URL", "https://bothub.chat/api/v2/openai/v1").rstrip("/")
 # Nano Banana 2 on BotHub == Google gemini-3.1-flash-image
 BOTHUB_IMAGE_MODEL = _env("BOTHUB_IMAGE_MODEL", "gemini-3.1-flash-image")
-# Cheaper image model when primary hits NOT_ENOUGH_TOKENS / CAPS.
-BOTHUB_IMAGE_MODEL_FALLBACK = _env("BOTHUB_IMAGE_MODEL_FALLBACK", "gemini-2.5-flash-image")
 # Final cover size after crop. Widescreen from BotHub reserves ~375k CAPS — generate square instead.
 BOTHUB_IMAGE_SIZE = _env("BOTHUB_IMAGE_SIZE", "1024x576")
 # BotHub request size (Eco-friendly). Keep square so CAPS reserve stays ~67k.
@@ -77,8 +75,6 @@ http_image = httpx.Client(timeout=httpx.Timeout(60.0, read=300.0))
 
 # ponytail: skip HF for the rest of the run after 402 credits; reset in run().
 _hf_skip_run = False
-# ponytail: after BotHub CAPS 403 on primary image model, use fallback for the rest of the run.
-_bothub_caps_fallback_run = False
 
 
 def to_ghost_filter_date(when: datetime) -> str:
@@ -326,59 +322,222 @@ def html_to_text(raw_html: str) -> str:
     return parser.text()
 
 
-# Layer A Unicode carriers from guillaumemeyer/watermarks-remover (MIT).
-# ponytail: lossless scrub only. Layer B paraphrase would rewrite the post;
-# image C2PA needs Ghost re-upload. Upgrade: HF rewrite + image round-trip.
+# Layer A from guillaumemeyer/watermarks-remover text_unicode.py (MIT).
+# Synced with upstream default clean_text(strip_bidi=False, normalize_spaces=False).
+# Ghost keeps NBSP; Latin confusables stay off (Cyrillic posts). Layer B / C2PA out of scope.
 _STRIP_CPS = frozenset(
     {
         0x00AD, 0x034F, 0x061C, 0x115F, 0x1160, 0x17B4, 0x17B5,
-        0x180B, 0x180C, 0x180D, 0x180E,
+        0x180B, 0x180C, 0x180D, 0x180E, 0x180F,
         0x200B, 0x200C, 0x200D, 0x200E, 0x200F,
         0x202A, 0x202B, 0x202C, 0x202D, 0x202E,
         0x2060, 0x2061, 0x2062, 0x2063, 0x2064,
         0x2066, 0x2067, 0x2068, 0x2069, 0x206A, 0x206B, 0x206C, 0x206D, 0x206E, 0x206F,
         0xFEFF,
         *range(0xFE00, 0xFE10),
+        0x3164, 0xFFA0,
         0xFFF9, 0xFFFA, 0xFFFB,
     }
 )
 _EMOJI_GLUE = frozenset({0x200D, 0xFE0E, 0xFE0F})
+_PRESERVABLE_BIDI = frozenset({0x061C, 0x200E, 0x200F, 0x2066, 0x2067, 0x2068, 0x2069})
+_SCRIPT_JOINERS = frozenset({0x200C, 0x200D})
+_MONGOLIAN_FVS = frozenset({0x180B, 0x180C, 0x180D, 0x180F})
+_KHMER_VOWELS = frozenset({0x17B4, 0x17B5})
+_HANGUL_FILLERS = frozenset({0x115F, 0x1160, 0x3164, 0xFFA0})
+_ORTHOGRAPHIC_CF = frozenset(
+    {0x0600, 0x0601, 0x0602, 0x0603, 0x0604, 0x0605, 0x06DD, 0x070F, 0x08E2, 0x110BD, 0x110CD}
+)
+_TAG_RANGE = range(0xE0020, 0xE0080)
+_RESERVED_IGNORABLE_CPS = frozenset({0x2065, 0xE0000})
+_RESERVED_IGNORABLE_RANGES = (
+    range(0xFFF0, 0xFFF9),
+    range(0xE0080, 0xE0100),
+    range(0xE01F0, 0xE1000),
+)
 _DATA_AI_ATTR = re.compile(r"\sdata-ai[\w-]*\s*=\s*[\"'][^\"']*[\"']", re.I)
 _A_TAG = re.compile(r"(<a\b[^>]*>)(.*?)(</a>)", re.I | re.S)
 _U_TAG = re.compile(r"</?u\b[^>]*>", re.I)
 
 
 def _is_emoji_base(cp: int) -> bool:
-    if 0x1F000 <= cp <= 0x1FAFF or 0x2600 <= cp <= 0x27BF or 0x2B00 <= cp <= 0x2BFF:
+    if 0x1F000 <= cp <= 0x1FAFF or 0x2190 <= cp <= 0x27BF or 0x2B00 <= cp <= 0x2BFF:
+        return True
+    if cp in (0x203C, 0x2049, 0x2139, 0x2934, 0x2935):
         return True
     if cp in (0x00A9, 0x00AE, 0x2122, 0x3030, 0x303D, 0x3297, 0x3299, 0x0023, 0x002A):
         return True
     return 0x0030 <= cp <= 0x0039
 
 
-def _is_mark_cp(cp: int) -> bool:
+def _is_reserved_ignorable(cp: int) -> bool:
+    if cp in _RESERVED_IGNORABLE_CPS:
+        return True
+    return any(cp in r for r in _RESERVED_IGNORABLE_RANGES)
+
+
+def _is_noncharacter(cp: int) -> bool:
+    return 0xFDD0 <= cp <= 0xFDEF or (cp & 0xFFFE) == 0xFFFE
+
+
+def _is_private_use(cp: int) -> bool:
+    return 0xE000 <= cp <= 0xF8FF or 0xF0000 <= cp <= 0xFFFFD or 0x100000 <= cp <= 0x10FFFD
+
+
+def _is_strip_cp(cp: int) -> bool:
     if cp in _STRIP_CPS:
         return True
     if 0xE0100 <= cp <= 0xE01EF or 0xE0001 <= cp <= 0xE007F:
         return True
-    return unicodedata.category(chr(cp)) == "Cf"
+    if _is_noncharacter(cp) or _is_reserved_ignorable(cp) or _is_private_use(cp):
+        return True
+    return False
+
+
+def _joining_script(cp: int) -> str | None:
+    for start, end, name in (
+        (0x0600, 0x08FF, "arabic"),
+        (0x0900, 0x0DFF, "indic"),
+        (0x0F00, 0x109F, "south-asian"),
+        (0x1780, 0x17FF, "khmer"),
+        (0x1800, 0x18AF, "mongolian"),
+    ):
+        if start <= cp <= end and unicodedata.category(chr(cp))[0] in ("L", "M"):
+            return name
+    return None
+
+
+def _is_cjk_ideograph(cp: int) -> bool:
+    return (
+        0x3400 <= cp <= 0x4DBF
+        or 0x4E00 <= cp <= 0x9FFF
+        or 0xF900 <= cp <= 0xFAFF
+        or 0x20000 <= cp <= 0x323AF
+    )
+
+
+def _is_mongolian_letter(cp: int) -> bool:
+    return 0x1800 <= cp <= 0x18AF and unicodedata.category(chr(cp))[0] == "L"
+
+
+def _is_khmer_letter(cp: int) -> bool:
+    return 0x1780 <= cp <= 0x17FF and unicodedata.category(chr(cp))[0] == "L"
+
+
+def _is_hangul_jamo(cp: int) -> bool:
+    return (
+        0x1100 <= cp <= 0x11FF
+        or 0xA960 <= cp <= 0xA97C
+        or 0xD7B0 <= cp <= 0xD7C6
+        or 0x3131 <= cp <= 0x318E
+        or 0xFFA1 <= cp <= 0xFFDC
+    )
+
+
+def _is_glue(cp: int) -> bool:
+    return (
+        cp in _EMOJI_GLUE
+        or cp in _SCRIPT_JOINERS
+        or cp in _TAG_RANGE
+        or cp in _MONGOLIAN_FVS
+        or cp in _KHMER_VOWELS
+        or cp in _HANGUL_FILLERS
+        or 0xE0100 <= cp <= 0xE01EF
+        or 0xFE00 <= cp <= 0xFE0F
+    )
+
+
+def _valid_flag_tag_indices(text: str) -> set[int]:
+    valid: set[int] = set()
+    i = 0
+    while i < len(text):
+        if ord(text[i]) != 0x1F3F4:
+            i += 1
+            continue
+        j = i + 1
+        while j < len(text) and 0xE0020 <= ord(text[j]) <= 0xE007E:
+            j += 1
+        if j > i + 1 and j < len(text) and ord(text[j]) == 0xE007F:
+            valid.update(range(i + 1, j + 1))
+            i = j + 1
+        else:
+            i += 1
+    return valid
+
+
+def _valid_bidi_embedding_indices(text: str) -> set[int]:
+    valid: set[int] = set()
+    stack: list[tuple[int, int]] = []
+    for index, char in enumerate(text):
+        cp = ord(char)
+        if cp in (0x202A, 0x202B, 0x202D, 0x202E):
+            stack.append((cp, index))
+        elif cp == 0x202C and stack:
+            opener, opener_index = stack.pop()
+            if opener in (0x202A, 0x202B):
+                valid.update((opener_index, index))
+    return valid
 
 
 def scrub_ai_marks(text: str) -> tuple[str, int]:
-    """Strip invisible Unicode watermarks. Keep emoji ZWJ/VS and NBSP."""
+    """Strip invisible Unicode watermarks. Keep emoji glue, NBSP, safe bidi."""
+    text = text or ""
     out: list[str] = []
-    prev: str | None = None
+    prev_kept: str | None = None
     removed = 0
-    for ch in text or "":
+    flag_tags = _valid_flag_tag_indices(text)
+    bidi_ok = _valid_bidi_embedding_indices(text)
+    for i, ch in enumerate(text):
         cp = ord(ch)
-        if cp in _EMOJI_GLUE and prev is not None and _is_emoji_base(ord(prev)):
+        prev_input = text[i - 1] if i > 0 else None
+        next_input = text[i + 1] if i + 1 < len(text) else None
+        keep = False
+        if i in bidi_ok or cp in _PRESERVABLE_BIDI:
+            keep = True
+        elif prev_input is not None:
+            prev_cp = ord(prev_input)
+            if cp in _MONGOLIAN_FVS and 0x1800 <= prev_cp <= 0x18AF:
+                keep = True
+            elif 0xE0100 <= cp <= 0xE01EF and _is_cjk_ideograph(prev_cp):
+                keep = True
+            elif 0xFE00 <= cp <= 0xFE0D and _is_cjk_ideograph(prev_cp):
+                keep = True
+        if not keep and cp in (0xFE0E, 0xFE0F) and prev_input and _is_emoji_base(ord(prev_input)):
+            keep = True
+        if (
+            not keep
+            and cp == 0x200D
+            and prev_kept is not None
+            and next_input is not None
+            and _is_emoji_base(ord(prev_kept))
+            and _is_emoji_base(ord(next_input))
+        ):
+            keep = True
+        if not keep and cp in _SCRIPT_JOINERS and prev_input and next_input:
+            left = _joining_script(ord(prev_input))
+            right = _joining_script(ord(next_input))
+            if left is not None and left == right:
+                keep = True
+        if not keep and cp in _TAG_RANGE and i in flag_tags:
+            keep = True
+        if not keep and cp in _MONGOLIAN_FVS and prev_kept and _is_mongolian_letter(ord(prev_kept)):
+            keep = True
+        if not keep and cp in _KHMER_VOWELS and prev_kept and _is_khmer_letter(ord(prev_kept)):
+            keep = True
+        if not keep and cp in _HANGUL_FILLERS and prev_kept and _is_hangul_jamo(ord(prev_kept)):
+            keep = True
+        if not keep and cp in _ORTHOGRAPHIC_CF:
+            keep = True
+        if keep:
             out.append(ch)
+            if not _is_glue(cp):
+                prev_kept = ch
             continue
-        if _is_mark_cp(cp):
+        if _is_strip_cp(cp) or (unicodedata.category(ch) == "Cf" and cp != 0x00A0):
             removed += 1
             continue
         out.append(ch)
-        prev = ch
+        prev_kept = ch
     return "".join(out), removed
 
 
@@ -632,25 +791,21 @@ def _is_bothub_insufficient_caps(status_code: int, body: str) -> bool:
     return status_code == 403 and bool(_BOTHUB_CAPS_RE.search(body or ""))
 
 
-def _bothub_image_models() -> list[str]:
-    """Primary then cheaper fallback; after a CAPS hit, fallback only for this run."""
-    primary = BOTHUB_IMAGE_MODEL
-    fallback = BOTHUB_IMAGE_MODEL_FALLBACK
-    if _bothub_caps_fallback_run and fallback and fallback != primary:
-        return [fallback]
-    models: list[str] = []
-    for model in (primary, fallback):
-        if model and model not in models:
-            models.append(model)
-    return models
+def generate_cover_image(prompt: str) -> bytes:
+    """Generate cover via BotHub at BOTHUB_GEN_SIZE, then crop to BOTHUB_IMAGE_SIZE.
 
-
-def _bothub_images_generations(model: str, prompt: str, headers: dict[str, str]) -> httpx.Response:
-    """One images/generations attempt; retries without optional fields on 400."""
+    Widescreen BotHub sizes reserve ~375k CAPS; square gen (~67k) + local crop avoids that.
+    """
+    if not BOTHUB_API_KEY:
+        raise RuntimeError("Missing BOTHUB_API_KEY")
+    headers = {
+        "Authorization": f"Bearer {BOTHUB_API_KEY}",
+        "Content-Type": "application/json",
+    }
     # JPEG for Telegram is done after upload (Ghost /format/jpeg/); do not send
     # output_format — BotHub may reject it as temporarily unavailable for the model.
     gen_body: dict[str, Any] = {
-        "model": model,
+        "model": BOTHUB_IMAGE_MODEL,
         "prompt": prompt,
         "n": 1,
         "size": BOTHUB_GEN_SIZE,
@@ -663,9 +818,11 @@ def _bothub_images_generations(model: str, prompt: str, headers: dict[str, str])
         json=gen_body,
     )
     if response.is_success:
-        return response
+        raw = _image_bytes_from_generations_payload(response.json())
+        return crop_cover_to_size(raw, BOTHUB_IMAGE_SIZE)
 
     err_snip = response.text[:400]
+    # Retry with a minimal OpenAI-shaped body if optional fields are rejected.
     if response.status_code == 400 and any(
         key in err_snip.lower()
         for key in ("output_format", "aspect_ratio", "size", "response_format", "unvailvable", "unavailable")
@@ -675,101 +832,53 @@ def _bothub_images_generations(model: str, prompt: str, headers: dict[str, str])
             response.status_code,
             err_snip,
         )
-        return http_image.post(
+        minimal = {
+            "model": BOTHUB_IMAGE_MODEL,
+            "prompt": prompt,
+            "n": 1,
+            "size": BOTHUB_GEN_SIZE,
+            "response_format": "b64_json",
+        }
+        response = http_image.post(
             f"{BOTHUB_BASE_URL}/images/generations",
             headers=headers,
-            json={
-                "model": model,
-                "prompt": prompt,
-                "n": 1,
-                "size": BOTHUB_GEN_SIZE,
-                "response_format": "b64_json",
-            },
+            json=minimal,
         )
-    return response
-
-
-def generate_cover_image(prompt: str) -> bytes:
-    """Generate cover via BotHub at BOTHUB_GEN_SIZE, then crop to BOTHUB_IMAGE_SIZE.
-
-    Widescreen BotHub sizes reserve ~375k CAPS; square gen (~67k) + local crop avoids that.
-    On NOT_ENOUGH_TOKENS, retry with BOTHUB_IMAGE_MODEL_FALLBACK for the rest of the run.
-    """
-    global _bothub_caps_fallback_run
-    if not BOTHUB_API_KEY:
-        raise RuntimeError("Missing BOTHUB_API_KEY")
-    headers = {
-        "Authorization": f"Bearer {BOTHUB_API_KEY}",
-        "Content-Type": "application/json",
-    }
-    models = _bothub_image_models()
-    last_response: httpx.Response | None = None
-    for i, model in enumerate(models):
-        response = _bothub_images_generations(model, prompt, headers)
-        last_response = response
         if response.is_success:
-            if i > 0 or _bothub_caps_fallback_run:
-                log.info("cover via BotHub fallback model %s", model)
             raw = _image_bytes_from_generations_payload(response.json())
             return crop_cover_to_size(raw, BOTHUB_IMAGE_SIZE)
-
         err_snip = response.text[:400]
-        if _is_bothub_insufficient_caps(response.status_code, response.text) and i + 1 < len(models):
-            _bothub_caps_fallback_run = True
-            log.warning(
-                "BotHub CAPS insufficient for %s — falling back to %s",
-                model,
-                models[i + 1],
-            )
-            continue
 
-        if response.status_code not in (404, 405):
-            if _is_bothub_insufficient_caps(response.status_code, response.text):
-                raise RuntimeError(
-                    f"BotHub CAPS insufficient for cover gen {BOTHUB_GEN_SIZE} "
-                    f"(models tried: {', '.join(models)}). Top up balance. API: {err_snip}"
-                )
-            log.error("BotHub images/generations → %s %s", response.status_code, err_snip)
-            response.raise_for_status()
-
-        # Endpoint missing for this model — try chat.completions, then next model.
-        log.info("BotHub images/generations unavailable for %s — trying chat.completions", model)
-        chat = http_image.post(
-            f"{BOTHUB_BASE_URL}/chat/completions",
-            headers=headers,
-            json={
-                "model": model,
-                "messages": [{"role": "user", "content": prompt}],
-                "max_tokens": 1024,
-            },
+    if _is_bothub_insufficient_caps(response.status_code, err_snip):
+        raise RuntimeError(
+            f"BotHub CAPS insufficient for cover gen {BOTHUB_GEN_SIZE}. "
+            f"Top up balance. API: {err_snip}"
         )
-        if chat.is_success:
-            if i > 0 or _bothub_caps_fallback_run:
-                log.info("cover via BotHub fallback model %s (chat)", model)
-            return crop_cover_to_size(
-                _image_bytes_from_chat_payload(chat.json()), BOTHUB_IMAGE_SIZE
-            )
+
+    if response.status_code not in (404, 405):
+        log.error("BotHub images/generations → %s %s", response.status_code, err_snip)
+        response.raise_for_status()
+
+    log.info("BotHub images/generations unavailable — trying chat.completions")
+    chat_body = {
+        "model": BOTHUB_IMAGE_MODEL,
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": 1024,
+    }
+    chat = http_image.post(
+        f"{BOTHUB_BASE_URL}/chat/completions",
+        headers=headers,
+        json=chat_body,
+    )
+    if chat.is_error:
         log.error("BotHub chat.completions → %s %s", chat.status_code, chat.text[:500])
-        if _is_bothub_insufficient_caps(chat.status_code, chat.text) and i + 1 < len(models):
-            _bothub_caps_fallback_run = True
-            log.warning(
-                "BotHub CAPS insufficient for %s (chat) — falling back to %s",
-                model,
-                models[i + 1],
-            )
-            continue
         if _is_bothub_insufficient_caps(chat.status_code, chat.text):
             raise RuntimeError(
-                "BotHub CAPS insufficient for cover generation "
-                f"(models tried: {', '.join(models)}). Top up balance. API: {chat.text[:400]}"
+                "BotHub CAPS insufficient for cover generation (chat fallback). "
+                f"Top up balance. API: {chat.text[:400]}"
             )
-        last_response = chat
-
-    if last_response is not None:
-        last_response.raise_for_status()
-    raise RuntimeError("BotHub cover generation failed with no response")
-
-
+    chat.raise_for_status()
+    return crop_cover_to_size(_image_bytes_from_chat_payload(chat.json()), BOTHUB_IMAGE_SIZE)
 
 
 def upload_ghost_image(raw: bytes, filename: str | None = None) -> str:
@@ -1285,9 +1394,8 @@ def process_post(post: dict[str, Any]) -> dict[str, Any]:
 
 
 def run() -> dict[str, Any]:
-    global _hf_skip_run, _bothub_caps_fallback_run
+    global _hf_skip_run
     _hf_skip_run = False
-    _bothub_caps_fallback_run = False
 
     for name, value in {
         "GHOST_URL": GHOST_URL,
@@ -1418,6 +1526,13 @@ def _self_check() -> None:
     assert scrub_ai_marks("a\u00a0b") == ("a\u00a0b", 0)
     family = "👨‍👩‍👧"
     assert scrub_ai_marks(family) == (family, 0)
+    # Upstream: keep LRM / paired LRE…PDF; strip free ZWJ, private use, U+180F alone.
+    assert scrub_ai_marks("a\u200eb") == ("a\u200eb", 0)
+    assert scrub_ai_marks("\u202aRTL\u202c") == ("\u202aRTL\u202c", 0)
+    assert scrub_ai_marks("a\u200db") == ("ab", 1)
+    assert scrub_ai_marks("x\ue000y") == ("xy", 1)
+    assert scrub_ai_marks("\u180f") == ("", 1)
+    assert scrub_ai_marks("\u00a9\ufe0f") == ("\u00a9\ufe0f", 0)
     html_out, n = scrub_post_html('<p data-ai-generated="yes">Hi\u200b</p>')
     assert n == 2 and "data-ai" not in html_out and "\u200b" not in html_out
     linked, n_u = unwrap_underline_in_links(
@@ -1470,9 +1585,6 @@ def _self_check() -> None:
     )
     assert not _is_bothub_insufficient_caps(403, '{"error":{"code":"OTHER"}}')
     assert not _is_bothub_insufficient_caps(500, "NOT_ENOUGH_TOKENS")
-    assert _bothub_image_models()[0] == BOTHUB_IMAGE_MODEL
-    if BOTHUB_IMAGE_MODEL_FALLBACK and BOTHUB_IMAGE_MODEL_FALLBACK != BOTHUB_IMAGE_MODEL:
-        assert BOTHUB_IMAGE_MODEL_FALLBACK in _bothub_image_models()
     assert BOTHUB_IMAGE_SIZE
     assert BOTHUB_GEN_SIZE
     assert parse_image_size("1024x576") == (1024, 576)

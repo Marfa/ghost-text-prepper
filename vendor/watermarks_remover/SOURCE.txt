@@ -1,0 +1,5 @@
+repo=https://github.com/guillaumemeyer/watermarks-remover
+path=service/scripts/text_unicode.py
+commit=c2c79590cbe5ce6f05cf53251cc0d02ebc216fff
+date=2026-08-23T06:34:40Z
+license=MIT

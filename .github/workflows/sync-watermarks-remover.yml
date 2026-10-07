@@ -1,0 +1,73 @@
+name: Sync watermarks-remover Layer A
+
+on:
+  schedule:
+    # Mondays 07:00 UTC
+    - cron: "0 7 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Fetch upstream text_unicode.py
+        id: sync
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          code=0
+          python scripts/sync_watermarks_remover.py || code=$?
+          if [ "$code" -eq 2 ]; then
+            echo "already up to date"
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ "$code" -ne 0 ]; then
+            exit "$code"
+          fi
+          python app.py --self-check
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Open pull request
+        if: steps.sync.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          commit=$(grep '^commit=' vendor/watermarks_remover/SOURCE.txt | cut -d= -f2)
+          short=${commit:0:12}
+          branch="chore/sync-watermarks-remover-${short}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -B "$branch"
+          git add vendor/watermarks_remover/text_unicode.py vendor/watermarks_remover/SOURCE.txt
+          git status --short
+          git commit -m "chore: sync watermarks-remover Layer A (${short})"
+          git push -u origin HEAD:"$branch" --force
+          existing=$(gh pr list --head "$branch" --json number --jq '.[0].number // empty')
+          if [ -n "$existing" ]; then
+            echo "PR #${existing} already open for ${branch}"
+            exit 0
+          fi
+          gh pr create \
+            --base main \
+            --head "$branch" \
+            --title "chore: sync watermarks-remover Layer A (${short})" \
+            --body "## Summary
+          - Auto-sync \`vendor/watermarks_remover/text_unicode.py\` from [guillaumemeyer/watermarks-remover](https://github.com/guillaumemeyer/watermarks-remover) (\`${short}\`).
+          - Ghost policy stays in \`app.py\` (\`normalize_spaces=False\`, no Latin confusables).
+
+          ## Test plan
+          - [ ] \`python app.py --self-check\`
+          - [ ] Review upstream diff for intentional keep/strip changes"

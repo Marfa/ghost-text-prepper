@@ -9,6 +9,7 @@ Follow [ponytail](https://github.com/DietrichGebert/ponytail):
 3. Prefer stdlib over new packages.
 4. Keep Ghost Admin JWT auth correct.
 5. One entry file (`app.py`) is intentional — do not split without a hard reason.
+6. Exception: `vendor/watermarks_remover/text_unicode.py` is an upstream MIT copy; update only via `scripts/sync_watermarks_remover.py` / the weekly sync workflow. Ghost policy stays in `scrub_ai_marks`.
 
 ## Dependencies (required)
 

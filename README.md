@@ -86,7 +86,7 @@ Secrets: `GHOST_ADMIN_API_KEY`, `HF_TOKEN`, `GROQ_API_KEY` (fallback), `BOTHUB_A
 
 Некоммерческое использование; производные работы — с тем же лицензированием; указание авторства обязательно.
 
-Layer A Unicode — [watermarks-remover](https://github.com/guillaumemeyer/watermarks-remover) `text_unicode.py` (MIT), default `clean_text` без нормализации пробелов и без Latin confusables.
+Layer A Unicode — vendored [watermarks-remover](https://github.com/guillaumemeyer/watermarks-remover) `text_unicode.py` (MIT) in `vendor/watermarks_remover/`. Ghost: `normalize_spaces=False`, без Latin confusables. Weekly Cron sync → PR (`.github/workflows/sync-watermarks-remover.yml`).
 
 ## Авторство и поддержка
 

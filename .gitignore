@@ -11,3 +11,5 @@ __pycache__/
 .DS_Store
 tmp/
 outputs/
+# Local Cursor SOCKS→HTTP bridge (canonical: twitch telegram/scripts/)
+scripts/git-http-socks-bridge.py

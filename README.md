@@ -14,7 +14,7 @@ python app.py
 | --- | --- |
 | [watermarks-remover](https://github.com/guillaumemeyer/watermarks-remover) Layer A | С тела и заголовка снимаются невидимые Unicode-пометки, `data-ai*` и лишние `<u>` внутри ссылок |
 | HF [openai/gpt-oss-20b](https://huggingface.co/openai/gpt-oss-20b), fallback [Groq](https://console.groq.com) | При `status:scheduled` в окне: `custom_excerpt`, `meta_description`, `og_description`, `twitter_description` |
-| [BotHub](https://bothub.ru/text-to-image-ai-generator) Nano Banana 2 (`gemini-3.1-flash-image`) | При `status:scheduled` в окне и пустом `feature_image`: обложка как `.jpg` в `feature_image` / `og_image` / `twitter_image` |
+| [BotHub](https://bothub.ru/text-to-image-ai-generator) Nano Banana 2 (`gemini-3.1-flash-image`), fallback `gemini-2.5-flash-image` при CAPS | При `status:scheduled` в окне и пустом `feature_image`: обложка как `.jpg` в `feature_image` / `og_image` / `twitter_image` |
 | Telegram OG | PNG-обложка → реальный `.jpg` в `og_image` / `twitter_image` (WebpageBot не любит JPEG под `.png` URL) |
 
 Нужен `HF_TOKEN` и/или `GROQ_API_KEY`. При 402 (credits HF) остаток прогона идёт через Groq. Текст поста не переписывается (Layer B / paraphrase выключен: это ломает тон). C2PA не трогается. Обложки — только если задан `BOTHUB_API_KEY`; посты с уже заполненным `feature_image` пропускаются (`SKIP_COVER_COMPLETE=1`).
@@ -78,7 +78,7 @@ Cron **каждые 30 минут**: workflow **Telegram OG fix (frequent)**.
 
 GitHub Actions: cron `0 6 * * *` UTC + `workflow_dispatch`.
 
-Secrets: `GHOST_ADMIN_API_KEY`, `HF_TOKEN`, `GROQ_API_KEY` (fallback), `BOTHUB_API_KEY` (обложки). Variables: `GHOST_URL`, `HF_TEXT_MODEL`, `BOTHUB_IMAGE_MODEL` (публичный URL сайта — не секрет, иначе Job Summary маскирует ссылки).
+Secrets: `GHOST_ADMIN_API_KEY`, `HF_TOKEN`, `GROQ_API_KEY` (fallback), `BOTHUB_API_KEY` (обложки). Variables: `GHOST_URL`, `HF_TEXT_MODEL`, `BOTHUB_IMAGE_MODEL`, `BOTHUB_IMAGE_MODEL_FALLBACK`, `BOTHUB_IMAGE_SIZE`, `BOTHUB_GEN_SIZE` (публичный URL сайта — не секрет, иначе Job Summary маскирует ссылки).
 
 ## Лицензия
 

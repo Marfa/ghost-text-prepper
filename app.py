@@ -46,6 +46,8 @@ BOTHUB_API_KEY = _env("BOTHUB_API_KEY")
 BOTHUB_BASE_URL = _env("BOTHUB_BASE_URL", "https://bothub.chat/api/v2/openai/v1").rstrip("/")
 # Nano Banana 2 on BotHub == Google gemini-3.1-flash-image
 BOTHUB_IMAGE_MODEL = _env("BOTHUB_IMAGE_MODEL", "gemini-3.1-flash-image")
+# Cheaper image model when primary hits NOT_ENOUGH_TOKENS / CAPS.
+BOTHUB_IMAGE_MODEL_FALLBACK = _env("BOTHUB_IMAGE_MODEL_FALLBACK", "gemini-2.5-flash-image")
 # Final cover size after crop. Widescreen from BotHub reserves ~375k CAPS — generate square instead.
 BOTHUB_IMAGE_SIZE = _env("BOTHUB_IMAGE_SIZE", "1024x576")
 # BotHub request size (Eco-friendly). Keep square so CAPS reserve stays ~67k.
@@ -76,6 +78,8 @@ http_image = httpx.Client(timeout=httpx.Timeout(60.0, read=300.0))
 
 # ponytail: skip HF for the rest of the run after 402 credits; reset in run().
 _hf_skip_run = False
+# ponytail: after BotHub CAPS 403 on primary image model, use fallback for the rest of the run.
+_bothub_caps_fallback_run = False
 
 
 def to_ghost_filter_date(when: datetime) -> str:
@@ -594,21 +598,25 @@ def _is_bothub_insufficient_caps(status_code: int, body: str) -> bool:
     return status_code == 403 and bool(_BOTHUB_CAPS_RE.search(body or ""))
 
 
-def generate_cover_image(prompt: str) -> bytes:
-    """Generate cover via BotHub at BOTHUB_GEN_SIZE, then crop to BOTHUB_IMAGE_SIZE.
+def _bothub_image_models() -> list[str]:
+    """Primary then cheaper fallback; after a CAPS hit, fallback only for this run."""
+    primary = BOTHUB_IMAGE_MODEL
+    fallback = BOTHUB_IMAGE_MODEL_FALLBACK
+    if _bothub_caps_fallback_run and fallback and fallback != primary:
+        return [fallback]
+    models: list[str] = []
+    for model in (primary, fallback):
+        if model and model not in models:
+            models.append(model)
+    return models
 
-    Widescreen BotHub sizes reserve ~375k CAPS; square gen (~67k) + local crop avoids that.
-    """
-    if not BOTHUB_API_KEY:
-        raise RuntimeError("Missing BOTHUB_API_KEY")
-    headers = {
-        "Authorization": f"Bearer {BOTHUB_API_KEY}",
-        "Content-Type": "application/json",
-    }
+
+def _bothub_images_generations(model: str, prompt: str, headers: dict[str, str]) -> httpx.Response:
+    """One images/generations attempt; retries without optional fields on 400."""
     # JPEG for Telegram is done after upload (Ghost /format/jpeg/); do not send
     # output_format — BotHub may reject it as temporarily unavailable for the model.
     gen_body: dict[str, Any] = {
-        "model": BOTHUB_IMAGE_MODEL,
+        "model": model,
         "prompt": prompt,
         "n": 1,
         "size": BOTHUB_GEN_SIZE,
@@ -621,11 +629,9 @@ def generate_cover_image(prompt: str) -> bytes:
         json=gen_body,
     )
     if response.is_success:
-        raw = _image_bytes_from_generations_payload(response.json())
-        return crop_cover_to_size(raw, BOTHUB_IMAGE_SIZE)
+        return response
 
     err_snip = response.text[:400]
-    # Retry with a minimal OpenAI-shaped body if optional fields are rejected.
     if response.status_code == 400 and any(
         key in err_snip.lower()
         for key in ("output_format", "aspect_ratio", "size", "response_format", "unvailvable", "unavailable")
@@ -635,53 +641,99 @@ def generate_cover_image(prompt: str) -> bytes:
             response.status_code,
             err_snip,
         )
-        minimal = {
-            "model": BOTHUB_IMAGE_MODEL,
-            "prompt": prompt,
-            "n": 1,
-            "size": BOTHUB_GEN_SIZE,
-            "response_format": "b64_json",
-        }
-        response = http_image.post(
+        return http_image.post(
             f"{BOTHUB_BASE_URL}/images/generations",
             headers=headers,
-            json=minimal,
+            json={
+                "model": model,
+                "prompt": prompt,
+                "n": 1,
+                "size": BOTHUB_GEN_SIZE,
+                "response_format": "b64_json",
+            },
         )
+    return response
+
+
+def generate_cover_image(prompt: str) -> bytes:
+    """Generate cover via BotHub at BOTHUB_GEN_SIZE, then crop to BOTHUB_IMAGE_SIZE.
+
+    Widescreen BotHub sizes reserve ~375k CAPS; square gen (~67k) + local crop avoids that.
+    On NOT_ENOUGH_TOKENS, retry with BOTHUB_IMAGE_MODEL_FALLBACK for the rest of the run.
+    """
+    global _bothub_caps_fallback_run
+    if not BOTHUB_API_KEY:
+        raise RuntimeError("Missing BOTHUB_API_KEY")
+    headers = {
+        "Authorization": f"Bearer {BOTHUB_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    models = _bothub_image_models()
+    last_response: httpx.Response | None = None
+    for i, model in enumerate(models):
+        response = _bothub_images_generations(model, prompt, headers)
+        last_response = response
         if response.is_success:
+            if i > 0 or _bothub_caps_fallback_run:
+                log.info("cover via BotHub fallback model %s", model)
             raw = _image_bytes_from_generations_payload(response.json())
             return crop_cover_to_size(raw, BOTHUB_IMAGE_SIZE)
+
         err_snip = response.text[:400]
+        if _is_bothub_insufficient_caps(response.status_code, response.text) and i + 1 < len(models):
+            _bothub_caps_fallback_run = True
+            log.warning(
+                "BotHub CAPS insufficient for %s — falling back to %s",
+                model,
+                models[i + 1],
+            )
+            continue
 
-    if _is_bothub_insufficient_caps(response.status_code, err_snip):
-        raise RuntimeError(
-            f"BotHub CAPS insufficient for cover gen {BOTHUB_GEN_SIZE}. "
-            f"Top up balance. API: {err_snip}"
+        if response.status_code not in (404, 405):
+            if _is_bothub_insufficient_caps(response.status_code, response.text):
+                raise RuntimeError(
+                    f"BotHub CAPS insufficient for cover gen {BOTHUB_GEN_SIZE} "
+                    f"(models tried: {', '.join(models)}). Top up balance. API: {err_snip}"
+                )
+            log.error("BotHub images/generations → %s %s", response.status_code, err_snip)
+            response.raise_for_status()
+
+        # Endpoint missing for this model — try chat.completions, then next model.
+        log.info("BotHub images/generations unavailable for %s — trying chat.completions", model)
+        chat = http_image.post(
+            f"{BOTHUB_BASE_URL}/chat/completions",
+            headers=headers,
+            json={
+                "model": model,
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": 1024,
+            },
         )
-
-    if response.status_code not in (404, 405):
-        log.error("BotHub images/generations → %s %s", response.status_code, err_snip)
-        response.raise_for_status()
-
-    log.info("BotHub images/generations unavailable — trying chat.completions")
-    chat_body = {
-        "model": BOTHUB_IMAGE_MODEL,
-        "messages": [{"role": "user", "content": prompt}],
-        "max_tokens": 1024,
-    }
-    chat = http_image.post(
-        f"{BOTHUB_BASE_URL}/chat/completions",
-        headers=headers,
-        json=chat_body,
-    )
-    if chat.is_error:
+        if chat.is_success:
+            if i > 0 or _bothub_caps_fallback_run:
+                log.info("cover via BotHub fallback model %s (chat)", model)
+            return crop_cover_to_size(
+                _image_bytes_from_chat_payload(chat.json()), BOTHUB_IMAGE_SIZE
+            )
         log.error("BotHub chat.completions → %s %s", chat.status_code, chat.text[:500])
+        if _is_bothub_insufficient_caps(chat.status_code, chat.text) and i + 1 < len(models):
+            _bothub_caps_fallback_run = True
+            log.warning(
+                "BotHub CAPS insufficient for %s (chat) — falling back to %s",
+                model,
+                models[i + 1],
+            )
+            continue
         if _is_bothub_insufficient_caps(chat.status_code, chat.text):
             raise RuntimeError(
-                "BotHub CAPS insufficient for cover generation (chat fallback). "
-                f"Top up balance. API: {chat.text[:400]}"
+                "BotHub CAPS insufficient for cover generation "
+                f"(models tried: {', '.join(models)}). Top up balance. API: {chat.text[:400]}"
             )
-    chat.raise_for_status()
-    return crop_cover_to_size(_image_bytes_from_chat_payload(chat.json()), BOTHUB_IMAGE_SIZE)
+        last_response = chat
+
+    if last_response is not None:
+        last_response.raise_for_status()
+    raise RuntimeError("BotHub cover generation failed with no response")
 
 
 def upload_ghost_image(raw: bytes, filename: str | None = None) -> str:
@@ -1197,8 +1249,9 @@ def process_post(post: dict[str, Any]) -> dict[str, Any]:
 
 
 def run() -> dict[str, Any]:
-    global _hf_skip_run
+    global _hf_skip_run, _bothub_caps_fallback_run
     _hf_skip_run = False
+    _bothub_caps_fallback_run = False
 
     for name, value in {
         "GHOST_URL": GHOST_URL,
@@ -1388,6 +1441,9 @@ def _self_check() -> None:
     )
     assert not _is_bothub_insufficient_caps(403, '{"error":{"code":"OTHER"}}')
     assert not _is_bothub_insufficient_caps(500, "NOT_ENOUGH_TOKENS")
+    assert _bothub_image_models()[0] == BOTHUB_IMAGE_MODEL
+    if BOTHUB_IMAGE_MODEL_FALLBACK and BOTHUB_IMAGE_MODEL_FALLBACK != BOTHUB_IMAGE_MODEL:
+        assert BOTHUB_IMAGE_MODEL_FALLBACK in _bothub_image_models()
     assert BOTHUB_IMAGE_SIZE
     assert BOTHUB_GEN_SIZE
     assert parse_image_size("1024x576") == (1024, 576)

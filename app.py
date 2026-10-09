@@ -44,10 +44,10 @@ GROQ_API_KEY = _env("GROQ_API_KEY")
 GROQ_TEXT_MODEL = _env("GROQ_TEXT_MODEL", "openai/gpt-oss-20b")
 BOTHUB_API_KEY = _env("BOTHUB_API_KEY")
 BOTHUB_BASE_URL = _env("BOTHUB_BASE_URL", "https://bothub.chat/api/v2/openai/v1").rstrip("/")
-# Nano Banana 2 on BotHub == Google gemini-3.1-flash-image
-BOTHUB_IMAGE_MODEL = _env("BOTHUB_IMAGE_MODEL", "gemini-3.1-flash-image")
-# Cheaper image model when primary hits NOT_ENOUGH_TOKENS / CAPS.
-BOTHUB_IMAGE_MODEL_FALLBACK = _env("BOTHUB_IMAGE_MODEL_FALLBACK", "gemini-2.5-flash-image")
+# BotHub image model for covers (always gemini-2.5-flash-image unless overridden).
+BOTHUB_IMAGE_MODEL = _env("BOTHUB_IMAGE_MODEL", "gemini-2.5-flash-image")
+# Optional second model on NOT_ENOUGH_TOKENS / CAPS (empty = no fallback).
+BOTHUB_IMAGE_MODEL_FALLBACK = _env("BOTHUB_IMAGE_MODEL_FALLBACK", "")
 # Final cover size after crop. Widescreen from BotHub reserves ~375k CAPS — generate square instead.
 BOTHUB_IMAGE_SIZE = _env("BOTHUB_IMAGE_SIZE", "1024x576")
 # BotHub request size (Eco-friendly). Keep square so CAPS reserve stays ~67k.

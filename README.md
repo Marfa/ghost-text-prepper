@@ -1,6 +1,6 @@
 # Ghost Text Prepper
 
-Раз в сутки чистит AI-пометки в **scheduled** постах Ghost, пишет короткие SEO/social-описания (≤146 символов) и готовит `.jpg` OG-картинки для Telegram. Для тех же scheduled без обложки генерирует cover через BotHub **Nano Banana 2** (`gemini-3.1-flash-image`) в `feature_image` / OG / Twitter.
+Раз в сутки чистит AI-пометки в **scheduled** постах Ghost, пишет короткие SEO/social-описания (≤146 символов) и готовит `.jpg` OG-картинки для Telegram. Для тех же scheduled без обложки генерирует cover через BotHub (`gemini-2.5-flash-image`) в `feature_image` / OG / Twitter.
 
 ```bash
 python app.py
@@ -14,7 +14,7 @@ python app.py
 | --- | --- |
 | [watermarks-remover](https://github.com/guillaumemeyer/watermarks-remover) Layer A | С тела и заголовка снимаются невидимые Unicode-пометки, `data-ai*` и лишние `<u>` внутри ссылок |
 | HF [openai/gpt-oss-20b](https://huggingface.co/openai/gpt-oss-20b), fallback [Groq](https://console.groq.com) | При `status:scheduled` в окне: `custom_excerpt`, `meta_description`, `og_description`, `twitter_description` |
-| [BotHub](https://bothub.ru/text-to-image-ai-generator) Nano Banana 2 (`gemini-3.1-flash-image`), fallback `gemini-2.5-flash-image` при CAPS | При `status:scheduled` в окне и пустом `feature_image`: обложка как `.jpg` в `feature_image` / `og_image` / `twitter_image` |
+| [BotHub](https://bothub.ru/text-to-image-ai-generator) `gemini-2.5-flash-image` | При `status:scheduled` в окне и пустом `feature_image`: обложка как `.jpg` в `feature_image` / `og_image` / `twitter_image` |
 | Telegram OG | PNG-обложка → реальный `.jpg` в `og_image` / `twitter_image` (WebpageBot не любит JPEG под `.png` URL) |
 
 Нужен `HF_TOKEN` и/или `GROQ_API_KEY`. При 402 (credits HF) остаток прогона идёт через Groq. Текст поста не переписывается (Layer B / paraphrase выключен: это ломает тон). C2PA не трогается. Обложки — только если задан `BOTHUB_API_KEY`; посты с уже заполненным `feature_image` пропускаются (`SKIP_COVER_COMPLETE=1`).

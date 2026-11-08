@@ -170,7 +170,7 @@ export default {
       const fresh = await ghostJson(env, "GET", `posts/${post.id}/`);
       const full = fresh.posts?.[0];
       if (!full) return Response.json({ ok: true, skipped: "missing" });
-      if (!["published", "scheduled", "draft"].includes(full.status)) {
+      if (!["published", "scheduled"].includes(full.status)) {
         return Response.json({ ok: true, skipped: full.status });
       }
       const result = await fixPost(env, full);

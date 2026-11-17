@@ -63,6 +63,15 @@ TAG_STATE_FILE = Path(_env("TAG_STATE_FILE", "state/current-tag.json"))
 _PNG_URL_RE = re.compile(r"\.png(?:\?|$)", re.I)
 _JPEG_URL_RE = re.compile(r"\.jpe?g(?:\?|$)", re.I)
 _SIZE_RE = re.compile(r"^(\d+)x(\d+)$", re.I)
+_UUID_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+    re.I,
+)
+_PREVIEW_UUID_RE = re.compile(
+    r"/p/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/?$",
+    re.I,
+)
+_GHOST_ID_RE = re.compile(r"^[0-9a-f]{24}$", re.I)
 
 _MAX_ARTICLE_CHARS = 6000
 _MAX_COVER_TOPIC_CHARS = 800
@@ -1009,6 +1018,141 @@ def fix_telegram_og_on_posts(
     return results
 
 
+def parse_post_ref(ref: str) -> tuple[str, str]:
+    """Parse a post URL, preview link, slug, uuid, or Ghost id → ``(kind, value)``.
+
+    ``kind`` is one of ``slug``, ``uuid``, ``id``.
+    """
+    raw = (ref or "").strip()
+    if not raw:
+        raise ValueError("empty post ref")
+    if "://" in raw or raw.startswith("/"):
+        path = urlparse(raw).path or ""
+        preview = _PREVIEW_UUID_RE.search(path)
+        if preview:
+            return "uuid", preview.group(1).lower()
+        parts = [p for p in path.split("/") if p]
+        if not parts:
+            raise ValueError(f"no slug in URL: {ref!r}")
+        tail = parts[-1]
+        if _UUID_RE.match(tail):
+            return "uuid", tail.lower()
+        return "slug", tail
+    if _UUID_RE.match(raw):
+        return "uuid", raw.lower()
+    if _GHOST_ID_RE.match(raw):
+        return "id", raw.lower()
+    return "slug", raw.strip("/")
+
+
+def fetch_post_by_ref(ref: str) -> dict[str, Any]:
+    """Load one post (with HTML) by URL, slug, uuid, or id."""
+    kind, value = parse_post_ref(ref)
+    if kind == "slug":
+        data = _ghost("GET", f"posts/slug/{value}/", params={"formats": "html"})
+        post = (data.get("posts") or [None])[0]
+    elif kind == "id":
+        data = _ghost("GET", f"posts/{value}/", params={"formats": "html"})
+        post = (data.get("posts") or [None])[0]
+    else:
+        found = list_posts(f"uuid:{value}")
+        post = found[0] if found else None
+        if post:
+            data = _ghost("GET", f"posts/{post['id']}/", params={"formats": "html"})
+            post = (data.get("posts") or [None])[0]
+    if not post:
+        raise RuntimeError(f"post not found: {ref!r} ({kind}={value})")
+    return post
+
+
+def run_prep_post(ref: str) -> dict[str, Any]:
+    """Scrub + excerpt + cover + Telegram OG for one post (any status)."""
+    global _hf_skip_run, _bothub_caps_fallback_run
+    _hf_skip_run = False
+    _bothub_caps_fallback_run = False
+
+    for name, value in {
+        "GHOST_URL": GHOST_URL,
+        "GHOST_ADMIN_API_KEY": GHOST_KEY,
+    }.items():
+        if not value:
+            raise RuntimeError(f"Missing {name}")
+    if not HF_TOKEN and not GROQ_API_KEY:
+        raise RuntimeError("Missing HF_TOKEN or GROQ_API_KEY")
+
+    kind, value = parse_post_ref(ref)
+    post = fetch_post_by_ref(ref)
+    log.info(
+        "prep-post %s (%s=%s) status=%s",
+        post.get("slug"),
+        kind,
+        value,
+        post.get("status"),
+    )
+
+    results: list[dict[str, Any]] = []
+    cover_results: list[dict[str, Any]] = []
+    try:
+        result = process_post(post)
+        results.append(result)
+        log.info("post %s: %s", post.get("id"), result)
+    except Exception as exc:
+        log.exception("post %s failed", post.get("id"))
+        results.append(
+            {
+                "id": post.get("id"),
+                "title": post.get("title"),
+                "slug": post.get("slug"),
+                "error": str(exc),
+            }
+        )
+
+    if BOTHUB_API_KEY and not any(r.get("error") for r in results):
+        post = fetch_post_by_ref(post["id"])
+        try:
+            cover = process_scheduled_cover(post)
+            cover_results.append(cover)
+            log.info("cover %s: %s", post.get("id"), cover)
+        except Exception as exc:
+            log.exception("cover %s failed", post.get("id"))
+            cover_results.append(
+                {
+                    "id": post.get("id"),
+                    "title": post.get("title"),
+                    "slug": post.get("slug"),
+                    "error": str(exc),
+                }
+            )
+    elif not BOTHUB_API_KEY:
+        log.info("BOTHUB_API_KEY unset — skipping cover generation")
+
+    if FIX_TELEGRAM_OG and not any(r.get("error") for r in results + cover_results):
+        post = fetch_post_by_ref(post["id"])
+        og_results = fix_telegram_og_on_posts([post], enabled=True)
+        results.extend(og_results)
+        if og_results:
+            log.info("telegram og: %s", og_results[0])
+
+    errors = sum(1 for r in results if r.get("error")) + sum(
+        1 for r in cover_results if r.get("error")
+    )
+    return {
+        "ref": ref,
+        "kind": kind,
+        "value": value,
+        "slug": post.get("slug"),
+        "status": post.get("status"),
+        "updated": sum(1 for r in results if r.get("updated"))
+        + sum(1 for r in cover_results if r.get("updated")),
+        "covers": sum(1 for r in cover_results if r.get("cover")),
+        "skipped": sum(1 for r in results if r.get("skipped"))
+        + sum(1 for r in cover_results if r.get("skipped")),
+        "errors": errors,
+        "results": results,
+        "cover_results": cover_results,
+    }
+
+
 def fix_telegram_og_slug(slug: str) -> dict[str, Any]:
     for name, value in {"GHOST_URL": GHOST_URL, "GHOST_ADMIN_API_KEY": GHOST_KEY}.items():
         if not value:
@@ -1499,6 +1643,17 @@ def _self_check() -> None:
         "custom_excerpt"
     ] == "a b"
     assert telegram_one_line_description_fields({"custom_excerpt": "ab"}) == {}
+    assert parse_post_ref(
+        "https://blog.themarfa.name/nakrutka-laikov-v-tvittere-na-zelenka-work/"
+    ) == ("slug", "nakrutka-laikov-v-tvittere-na-zelenka-work")
+    assert parse_post_ref(
+        "https://blog.themarfa.name/p/d4f5107f-3864-4a32-b401-edbe9c6ab477/"
+    ) == ("uuid", "d4f5107f-3864-4a32-b401-edbe9c6ab477")
+    assert parse_post_ref("nakrutka-laikov-v-tvittere-na-zelenka-work") == (
+        "slug",
+        "nakrutka-laikov-v-tvittere-na-zelenka-work",
+    )
+    assert parse_post_ref("6afc09ad164e0e0001943911") == ("id", "6afc09ad164e0e0001943911")
     log.info("self-check ok")
 
 
@@ -1508,6 +1663,11 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="Ghost scheduled-post prep and tag rotation")
     parser.add_argument("--self-check", action="store_true", help="run helper self-check only")
+    parser.add_argument(
+        "--prep-post",
+        metavar="URL_OR_SLUG",
+        help="prep one post by public URL, preview /p/<uuid>/, slug, uuid, or Ghost id",
+    )
     parser.add_argument(
         "--fix-telegram-og",
         action="store_true",
@@ -1542,6 +1702,41 @@ if __name__ == "__main__":
     if args.self_check:
         _self_check()
         sys.exit(0)
+
+    if args.prep_post:
+        _self_check()
+        summary = run_prep_post(args.prep_post)
+        log.info(
+            "prep-post done: slug=%s status=%s updated=%s covers=%s skipped=%s errors=%s",
+            summary.get("slug"),
+            summary.get("status"),
+            summary["updated"],
+            summary["covers"],
+            summary["skipped"],
+            summary["errors"],
+        )
+        summary_path = os.getenv("GITHUB_STEP_SUMMARY")
+        if summary_path:
+            lines = [
+                "## Prep one post",
+                "",
+                f"- Ref: `{summary.get('ref')}`",
+                f"- Slug: `{summary.get('slug')}` (`{summary.get('status')}`)",
+                f"- Updated: {summary['updated']}, covers: {summary['covers']}, "
+                f"skipped: {summary['skipped']}, errors: {summary['errors']}",
+            ]
+            for item in summary.get("results") or []:
+                if item.get("excerpt"):
+                    lines.append(f"- Excerpt: {item['excerpt']}")
+                if item.get("error"):
+                    lines.append(f"- Error: {item['error']}")
+            for item in summary.get("cover_results") or []:
+                if item.get("image_url"):
+                    lines.append(f"- Cover: {item['image_url']}")
+                if item.get("error"):
+                    lines.append(f"- Cover error: {item['error']}")
+            Path(summary_path).write_text("\n".join(lines) + "\n", encoding="utf-8")
+        sys.exit(1 if summary["errors"] else 0)
 
     if args.fix_telegram_og or args.fix_telegram_og_recent is not None or args.fix_telegram_og_slug:
         _self_check()

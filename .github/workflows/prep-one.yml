@@ -1,0 +1,52 @@
+name: Prep one post
+
+on:
+  workflow_dispatch:
+    inputs:
+      post:
+        description: "Post URL, preview /p/<uuid>/, slug, uuid, or Ghost id"
+        required: true
+        type: string
+      force:
+        description: "Regenerate excerpt and cover even if already set"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  prep-one:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      - run: python app.py --self-check
+
+      - name: Prep post
+        env:
+          GHOST_URL: ${{ vars.GHOST_URL }}
+          GHOST_ADMIN_API_KEY: ${{ secrets.GHOST_ADMIN_API_KEY }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_TEXT_MODEL: ${{ vars.HF_TEXT_MODEL }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          GROQ_TEXT_MODEL: ${{ vars.GROQ_TEXT_MODEL }}
+          BOTHUB_API_KEY: ${{ secrets.BOTHUB_API_KEY }}
+          BOTHUB_IMAGE_MODEL: ${{ vars.BOTHUB_IMAGE_MODEL }}
+          BOTHUB_IMAGE_MODEL_FALLBACK: ${{ vars.BOTHUB_IMAGE_MODEL_FALLBACK }}
+          BOTHUB_IMAGE_SIZE: ${{ vars.BOTHUB_IMAGE_SIZE }}
+          BOTHUB_GEN_SIZE: ${{ vars.BOTHUB_GEN_SIZE }}
+          MAX_EXCERPT_LEN: "146"
+          SKIP_COMPLETE: ${{ inputs.force && '0' || '1' }}
+          SKIP_COVER_COMPLETE: ${{ inputs.force && '0' || '1' }}
+          FIX_TELEGRAM_OG: "1"
+          POST_REF: ${{ inputs.post }}
+        run: python app.py --prep-post "$POST_REF"

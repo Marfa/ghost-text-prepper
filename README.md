@@ -35,7 +35,14 @@ python app.py
 python app.py --fix-telegram-og
 ```
 
-Один пост:
+Один пост (scrub + excerpt + cover + Telegram OG) — локально или Actions **Prep one post**:
+
+```bash
+python app.py --prep-post https://blog.themarfa.name/nakrutka-laikov-v-tvittere-na-zelenka-work/
+# или slug / preview /p/<uuid>/ / Ghost id
+```
+
+Только Telegram OG по slug:
 
 ```bash
 python app.py --fix-telegram-og-slug kak-besplatno-nastroit-sinkhronizatsiiu-obsidian-s-pomoshchiu-livesync
@@ -76,7 +83,7 @@ Cron **каждые 30 минут**: workflow **Telegram OG fix (frequent)**.
 
 ## Автоматизация
 
-GitHub Actions: cron `0 6 * * *` UTC + `workflow_dispatch`.
+GitHub Actions: cron `0 6 * * *` UTC + `workflow_dispatch`. Ручная обработка одной ссылки: Actions → **Prep one post** (поле `post` = URL/slug, опционально `force`).
 
 Secrets: `GHOST_ADMIN_API_KEY`, `HF_TOKEN`, `GROQ_API_KEY` (fallback), `BOTHUB_API_KEY` (обложки). Variables: `GHOST_URL`, `HF_TEXT_MODEL`, `BOTHUB_IMAGE_MODEL`, `BOTHUB_IMAGE_MODEL_FALLBACK`, `BOTHUB_IMAGE_SIZE`, `BOTHUB_GEN_SIZE` (публичный URL сайта — не секрет, иначе Job Summary маскирует ссылки).
 

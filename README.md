@@ -39,7 +39,7 @@ python app.py --fix-telegram-og
 
 ```bash
 python app.py --prep-post https://blog.themarfa.name/nakrutka-laikov-v-tvittere-na-zelenka-work/
-# или slug / preview /p/<uuid>/ / Ghost id
+# или Admin #/editor/post/<id> / slug / preview /p/<uuid>/ / Ghost id
 ```
 
 Только Telegram OG по slug:

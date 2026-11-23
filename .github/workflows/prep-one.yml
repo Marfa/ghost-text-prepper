@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       post:
-        description: "Post URL, preview /p/<uuid>/, slug, uuid, or Ghost id"
+        description: "Post URL, Admin editor link (#/editor/post/<id>), preview /p/<uuid>/, slug, uuid, or id"
         required: true
         type: string
       force:

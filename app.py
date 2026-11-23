@@ -72,6 +72,11 @@ _PREVIEW_UUID_RE = re.compile(
     re.I,
 )
 _GHOST_ID_RE = re.compile(r"^[0-9a-f]{24}$", re.I)
+# Ghost Admin SPA: https://site/ghost/#/editor/post/<24-hex-id>
+_ADMIN_EDITOR_RE = re.compile(
+    r"(?:^|/)editor/(?:post|page)/([0-9a-f]{24})(?:/|$)",
+    re.I,
+)
 
 _MAX_ARTICLE_CHARS = 6000
 _MAX_COVER_TOPIC_CHARS = 800
@@ -1019,24 +1024,38 @@ def fix_telegram_og_on_posts(
 
 
 def parse_post_ref(ref: str) -> tuple[str, str]:
-    """Parse a post URL, preview link, slug, uuid, or Ghost id → ``(kind, value)``.
+    """Parse a post URL, Admin editor link, preview, slug, uuid, or Ghost id.
 
-    ``kind`` is one of ``slug``, ``uuid``, ``id``.
+    Returns ``(kind, value)`` where ``kind`` is ``slug``, ``uuid``, or ``id``.
     """
     raw = (ref or "").strip()
     if not raw:
         raise ValueError("empty post ref")
-    if "://" in raw or raw.startswith("/"):
-        path = urlparse(raw).path or ""
+
+    # Ghost Admin hash routes live in the fragment (urlparse.path is only /ghost/).
+    admin = _ADMIN_EDITOR_RE.search(raw)
+    if admin:
+        return "id", admin.group(1).lower()
+
+    if "://" in raw or raw.startswith("/") or raw.startswith("#"):
+        parsed = urlparse(raw if "://" in raw or raw.startswith("/") else f"https://x.invalid/{raw}")
+        fragment = (parsed.fragment or "").lstrip("/")
+        if fragment:
+            admin_frag = _ADMIN_EDITOR_RE.search(fragment)
+            if admin_frag:
+                return "id", admin_frag.group(1).lower()
+        path = parsed.path or ""
         preview = _PREVIEW_UUID_RE.search(path)
         if preview:
             return "uuid", preview.group(1).lower()
-        parts = [p for p in path.split("/") if p]
+        parts = [p for p in path.split("/") if p and p.lower() != "ghost"]
         if not parts:
             raise ValueError(f"no slug in URL: {ref!r}")
         tail = parts[-1]
         if _UUID_RE.match(tail):
             return "uuid", tail.lower()
+        if _GHOST_ID_RE.match(tail):
+            return "id", tail.lower()
         return "slug", tail
     if _UUID_RE.match(raw):
         return "uuid", raw.lower()
@@ -1654,6 +1673,13 @@ def _self_check() -> None:
         "nakrutka-laikov-v-tvittere-na-zelenka-work",
     )
     assert parse_post_ref("6afc09ad164e0e0001943911") == ("id", "6afc09ad164e0e0001943911")
+    assert parse_post_ref(
+        "https://test1574.ghost.io/ghost/#/editor/post/6b03fe4217e4610001440ddd"
+    ) == ("id", "6b03fe4217e4610001440ddd")
+    assert parse_post_ref("#/editor/post/6b03fe4217e4610001440ddd") == (
+        "id",
+        "6b03fe4217e4610001440ddd",
+    )
     log.info("self-check ok")
 
 
@@ -1666,7 +1692,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--prep-post",
         metavar="URL_OR_SLUG",
-        help="prep one post by public URL, preview /p/<uuid>/, slug, uuid, or Ghost id",
+        help="prep one post by public URL, Admin #/editor/post/<id>, preview /p/<uuid>/, slug, uuid, or id",
     )
     parser.add_argument(
         "--fix-telegram-og",
